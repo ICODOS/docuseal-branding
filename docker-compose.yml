@@ -1,0 +1,55 @@
+# ICODOS-branded DocuSeal stack — sign.icodos.com
+# Based on the original /opt/docuseal/docker-compose.yml, with:
+#   1. Image pinned to a tested version (no surprise updates that could break the view overrides)
+#   2. Branding overlay files mounted over the stock views (see ./branding)
+#
+# Modified views are published at: https://github.com/ICODOS/docuseal-branding
+# (AGPL-3.0 compliance — DocuSeal attribution retained per LICENSE_ADDITIONAL_TERMS)
+
+services:
+  app:
+    image: docuseal/docuseal:3.1.5
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - docuseal:/data/docuseal
+      - ./branding/submit_form__docuseal_logo.html.erb:/app/app/views/submit_form/_docuseal_logo.html.erb:ro
+      - ./branding/start_form__docuseal_logo.html.erb:/app/app/views/start_form/_docuseal_logo.html.erb:ro
+      - ./branding/icodos-logo.png:/app/public/icodos-logo.png:ro
+    environment:
+      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/docuseal
+      - FORCE_SSL=${HOST}
+
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=docuseal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    command: caddy reverse-proxy --from https://${HOST} --to app:3000
+    volumes:
+      - caddy_data:/data
+    environment:
+      - HOST=${HOST}
+
+volumes:
+  docuseal:
+  pg_data:
+  caddy_data:

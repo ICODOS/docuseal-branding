@@ -17,6 +17,8 @@ services:
       - docuseal:/data/docuseal
       - ./branding/submit_form__docuseal_logo.html.erb:/app/app/views/submit_form/_docuseal_logo.html.erb:ro
       - ./branding/start_form__docuseal_logo.html.erb:/app/app/views/start_form/_docuseal_logo.html.erb:ro
+      - ./branding/mailer_attribution.html.erb:/app/app/views/shared/_mailer_attribution.html.erb:ro
+      - ./branding/head_tags.html.erb:/app/app/views/layouts/_head_tags.html.erb:ro
       - ./branding/icodos-logo.png:/app/public/icodos-logo.png:ro
     environment:
       - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/docuseal

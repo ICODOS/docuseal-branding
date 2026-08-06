@@ -8,7 +8,7 @@
 
 services:
   app:
-    image: docuseal/docuseal:3.1.5
+    image: docuseal/docuseal:3.1.6
     restart: unless-stopped
     depends_on:
       postgres:

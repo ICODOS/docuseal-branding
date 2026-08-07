@@ -2,28 +2,31 @@
 <%# The shared navbar is hidden on unauth pages (see shared/_navbar.html.erb %>
 <%# overlay), so the centered ICODOS logo is the only brand on the page. %>
 <%= content_for(:canonical_url, root_url) %>
-<div class="max-w-md mx-auto px-4 text-center pt-24 pb-16">
-  <img src="/icodos-logo.png" alt="ICODOS" style="height: 4.5rem; width: auto;" class="mx-auto">
 
-  <h1 class="text-2xl font-semibold mt-10">
+<div class="max-w-md mx-auto px-4 text-center" style="padding-top: 5rem; padding-bottom: 2rem;">
+  <img src="/icodos-logo.png" alt="ICODOS" style="height: 5rem; width: auto;" class="mx-auto">
+
+  <h1 class="text-2xl" style="margin-top: 2rem; font-weight: 600;">
     Document signing for ICODOS
   </h1>
-  <p class="text-base text-gray-500 mt-2">
+  <p class="text-gray-500 mt-2">
     Internal use only — staff sign in with Microsoft.
   </p>
 
-  <a href="/auth/entra" class="base-button block text-lg mt-10">
+  <a href="/auth/entra" class="base-button w-full" style="margin-top: 2.5rem;">
     Sign in with Microsoft
   </a>
 
-  <p class="mt-8 text-sm text-gray-500 leading-relaxed">
-    Have a document to sign? Check your email for a personal signing link —
+  <p class="text-sm text-gray-500 mt-8" style="line-height: 1.6;">
+    Have a document to sign?<br>
+    Check your email for a personal signing link —
     you don't need to sign in on this page.
   </p>
 </div>
 
-<p class="text-center text-xs text-gray-400 mt-16 pb-6">
+<p class="text-center text-xs text-gray-400" style="margin-top: 3rem; padding-bottom: 1.5rem;">
   <a href="<%= new_user_session_path %>" class="link">Password sign-in</a>
   <span class="mx-2">·</span>
-  Powered by <a href="https://github.com/docusealco/docuseal" target="_blank" rel="noopener" class="link">DocuSeal</a>
+  Powered by
+  <a href="https://github.com/docusealco/docuseal" target="_blank" rel="noopener" class="link">DocuSeal</a>
 </p>

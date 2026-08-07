@@ -1,45 +1,54 @@
 <%# ICODOS sign-in page. Navbar is hidden on unauth pages, so the centered %>
 <%# ICODOS logo here is the only brand on the page. Microsoft SSO is the %>
-<%# primary CTA; the password form is styled as a secondary fallback. %>
+<%# primary CTA; the password form is styled as a secondary fallback inside %>
+<%# the same card so the visual hierarchy stays clear. %>
 <%= content_for(:canonical_url, new_user_session_url) %>
-<div class="max-w-sm mx-auto px-4 pt-20 pb-16">
+
+<div class="max-w-md mx-auto px-4" style="padding-top: 4rem; padding-bottom: 3rem;">
   <%= render 'devise/shared/select_server' if Docuseal.multitenant? %>
 
-  <div class="text-center mb-14">
-    <img src="/icodos-logo.png" alt="ICODOS" style="height: 3rem; width: auto;" class="mx-auto">
+  <div class="text-center" style="margin-bottom: 2rem;">
+    <img src="/icodos-logo.png" alt="ICODOS" style="height: 2.75rem; width: auto;" class="mx-auto">
   </div>
 
-  <a href="/auth/entra" class="base-button block text-center text-lg">
-    Sign in with Microsoft
-  </a>
-  <p class="text-sm text-gray-500 mt-3 text-center">
-    Use your ICODOS Microsoft account.
-  </p>
+  <div class="card bg-base-200 rounded-2xl">
+    <div class="card-body">
 
-  <div class="flex items-center my-10" aria-hidden="true">
-    <div class="flex-grow border-t border-gray-300"></div>
-    <span class="mx-4 text-xs uppercase tracking-wider text-gray-400">or password</span>
-    <div class="flex-grow border-t border-gray-300"></div>
+      <a href="/auth/entra" class="base-button w-full">
+        Sign in with Microsoft
+      </a>
+      <p class="text-sm text-center text-gray-500 mt-2">
+        Use your ICODOS Microsoft account
+      </p>
+
+      <div style="margin-top: 1.75rem; margin-bottom: 0.5rem;">
+        <div class="border-t border-base-300"></div>
+      </div>
+      <p class="text-center text-xs text-gray-400" style="margin-top: 0.75rem; margin-bottom: 1.25rem; letter-spacing: 0.08em;">
+        OR CONTINUE WITH PASSWORD
+      </p>
+
+      <%= form_for(resource, as: resource_name, html: { class: 'space-y-4' }, data: { turbo: params[:redir].blank? }, url: session_path(resource_name)) do |f| %>
+        <%= render 'hidden_fields' %>
+        <div class="form-control">
+          <%= f.label :email, t(:email), class: 'label' %>
+          <%= f.email_field :email, autocomplete: 'email', class: 'base-input' %>
+        </div>
+        <div class="form-control">
+          <%= f.label :password, t(:password), class: 'label' %>
+          <%= f.password_field :password, autocomplete: 'current-password', class: 'base-input' %>
+        </div>
+        <div class="form-control">
+          <%= f.button button_title(title: t(:sign_in), disabled_with: t(:signing_in)), class: 'btn btn-outline btn-neutral w-full' %>
+        </div>
+      <% end %>
+
+      <%= render 'omniauthable' %>
+    </div>
   </div>
 
-  <%= form_for(resource, as: resource_name, html: { class: 'space-y-4' }, data: { turbo: params[:redir].blank? }, url: session_path(resource_name)) do |f| %>
-    <%= render 'hidden_fields' %>
-    <div class="space-y-3" dir="auto">
-      <div class="form-control">
-        <%= f.label :email, t(:email), class: 'label' %>
-        <%= f.email_field :email, autocomplete: 'email', class: 'base-input' %>
-      </div>
-      <div class="form-control">
-        <%= f.label :password, t(:password), class: 'label' %>
-        <%= f.password_field :password, autocomplete: 'current-password', class: 'base-input' %>
-      </div>
-    </div>
-    <div class="form-control">
-      <%= f.button button_title(title: t(:sign_in), disabled_with: t(:signing_in)), class: 'btn btn-outline w-full text-base' %>
-    </div>
-  <% end %>
-
-  <%= render 'omniauthable' %>
-  <%= render 'extra_links' %>
-  <%= render 'devise/shared/links' %>
+  <div style="margin-top: 1.5rem;">
+    <%= render 'extra_links' %>
+    <%= render 'devise/shared/links' %>
+  </div>
 </div>

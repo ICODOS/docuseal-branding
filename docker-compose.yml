@@ -20,9 +20,16 @@ services:
       - ./branding/mailer_attribution.html.erb:/app/app/views/shared/_mailer_attribution.html.erb:ro
       - ./branding/head_tags.html.erb:/app/app/views/layouts/_head_tags.html.erb:ro
       - ./branding/icodos-logo.png:/app/public/icodos-logo.png:ro
+      - ./sso/entra_auth_controller.rb:/app/app/controllers/sso/entra_auth_controller.rb:ro
+      - ./sso/zz_sso_entra.rb:/app/config/initializers/zz_sso_entra.rb:ro
     environment:
       - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/docuseal
       - FORCE_SSL=${HOST}
+      - ENTRA_TENANT_ID=${ENTRA_TENANT_ID:-}
+      - ENTRA_CLIENT_ID=${ENTRA_CLIENT_ID:-}
+      - ENTRA_CLIENT_SECRET=${ENTRA_CLIENT_SECRET:-}
+      - SSO_ENFORCE=${SSO_ENFORCE:-false}
+      - SSO_BREAK_GLASS=${SSO_BREAK_GLASS:-false}
 
   postgres:
     image: postgres:16

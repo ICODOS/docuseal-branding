@@ -11,9 +11,11 @@ Branding overlay for our self-hosted [DocuSeal](https://github.com/docusealco/do
 | `branding/mailer_attribution.html.erb` | Empties the "Sent using DocuSeal" footer in all outgoing emails (see license note below) |
 | `branding/head_tags.html.erb` | Browser tab title: "ICODOS – Document Signing" instead of "DocuSeal \| Open Source Document Signing" |
 | `branding/icodos-logo.png` | ICODOS logo (black, transparent background) served at `/icodos-logo.png` |
-| `docker-compose.yml` | Stock compose file plus the five overlay mounts and a pinned image version |
+| `sso/entra_auth_controller.rb` | OIDC controller for Microsoft Entra SSO — `/auth/entra` and `/auth/entra/callback` |
+| `sso/zz_sso_entra.rb` | Initializer that registers the SSO routes and enforces password-login blocking |
+| `docker-compose.yml` | Stock compose file plus the overlay mounts, SSO env vars, and a pinned image version |
 
-Everything else — application code, database, TLS, email templates — is the unmodified official image `docuseal/docuseal` (pinned, currently `3.1.5`). Email wording, policy links, and the completion message are configured in the app's own Personalization settings, not in this repo.
+Everything else — application code, database, TLS, email templates — is the unmodified official image `docuseal/docuseal` (pinned, currently `3.1.6`). Email wording, policy links, and the completion message are configured in the app's own Personalization settings, not in this repo.
 
 ## License compliance (AGPL-3.0)
 
@@ -22,6 +24,48 @@ DocuSeal is AGPL-3.0 with [additional terms](https://github.com/docusealco/docus
 - Both modified page templates keep a visible "Powered by DocuSeal" line on the signing and status pages.
 - The email footer attribution is removed by `mailer_attribution.html.erb`; emails are not an interactive user interface, so we read the additional terms as not covering them. If DocuSeal clarifies otherwise, this override is a one-line revert.
 - This repository is public, which satisfies the AGPL source-availability requirement for our modifications.
+
+## Microsoft Entra SSO overlay
+
+Staff sign in via Microsoft Entra ID (Azure AD). The community DocuSeal image doesn't ship SSO — we add a small OIDC layer over the top with no changes to the base image and no new gems.
+
+### How it works
+
+- `GET /auth/entra` starts an OpenID Connect authorization-code flow with PKCE.
+- `GET /auth/entra/callback` verifies the returned `id_token` (RS256 signature against Entra's JWKS, `iss`, `aud`, `exp`, `nbf`, `nonce`, and the `state` CSRF value — all checks are mandatory, none can be disabled) and matches the `preferred_username` / `email` claim, case-insensitively, against an existing DocuSeal user.
+- No auto-provisioning. Unknown emails are refused with a message.
+- Public signing routes (`/d/`, `/s/`, `/p/`) are untouched — external counterparties never see any of this.
+
+### Environment variables (in `/opt/docuseal/.env`, not in this repo)
+
+| Key | Purpose |
+|---|---|
+| `ENTRA_TENANT_ID` | Microsoft tenant GUID |
+| `ENTRA_CLIENT_ID` | App registration (client) ID |
+| `ENTRA_CLIENT_SECRET` | App registration client secret — sensitive; do not commit or log |
+| `SSO_ENFORCE` | `true` blocks all password sign-in and password-reset routes. Default `false`. |
+| `SSO_BREAK_GLASS` | `true` re-enables password login even when `SSO_ENFORCE=true`. Default `false`. |
+
+Redirect URI to register in the Azure portal: `https://sign.icodos.com/auth/entra/callback`
+
+### Break-glass procedure
+
+If Entra has an outage, if the client secret expires, or if the config is wrong and staff can't sign in:
+
+```bash
+ssh root@sign.icodos.com
+cd /opt/docuseal
+# Edit .env — set SSO_BREAK_GLASS=true (add the line if missing)
+docker compose up -d
+```
+
+Within ~5 seconds password login is available again. Fix Entra, then flip `SSO_BREAK_GLASS` back to `false` and `docker compose up -d` once more.
+
+A misconfigured SSO (any of `ENTRA_TENANT_ID` / `ENTRA_CLIENT_ID` / `ENTRA_CLIENT_SECRET` missing) is treated as an implicit break-glass — password login stays enabled and a warning is logged at boot. This is deliberate: a bad config must never lock admins out of their own instance.
+
+### AGPL note
+
+The SSO layer is our own code, distributed under the same public repository. DocuSeal attribution in the DocuSeal UI is unchanged.
 
 ## Deploying / updating on the server
 
@@ -34,7 +78,7 @@ git clone https://github.com/ICODOS/docuseal-branding.git tmp-branding \
 docker compose up -d --force-recreate app
 ```
 
-(`.env` with `HOST` and `POSTGRES_PASSWORD` already lives in `/opt/docuseal` and is not part of this repo.)
+(`.env` with `HOST`, `POSTGRES_PASSWORD`, and the SSO variables from the section above already lives in `/opt/docuseal` and is not part of this repo.)
 
 ## MCP server
 

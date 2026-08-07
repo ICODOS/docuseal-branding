@@ -41,7 +41,8 @@ module Sso
         nonce: nonce,
         code_challenge: code_challenge,
         redirect_uri: callback_url,
-        scope: 'openid profile email'
+        scope: 'openid profile email',
+        prompt: sanitized_prompt(params[:prompt])
       )
 
       redirect_to auth_uri, allow_other_host: true
@@ -175,6 +176,18 @@ module Sso
       [email.split('@').first.presence, nil]
     end
 
+    # Whitelist the OIDC `prompt` parameter to the three safe interactive
+    # values. Deliberately blocks `prompt=none` (silent auth that errors on
+    # any required interaction) since we want callers to always see a UI
+    # when they pass a prompt at all.
+    def sanitized_prompt(raw)
+      return nil if raw.blank?
+      value = raw.to_s
+      return value if %w[login select_account consent].include?(value)
+
+      nil
+    end
+
     def safe_return_to(param)
       s = param.to_s
       return nil if s.empty?
@@ -202,7 +215,7 @@ module Sso
         @client_secret = ENV.fetch('ENTRA_CLIENT_SECRET')
       end
 
-      def authorization_uri(state:, nonce:, code_challenge:, redirect_uri:, scope:)
+      def authorization_uri(state:, nonce:, code_challenge:, redirect_uri:, scope:, prompt: nil)
         query = {
           client_id: @client_id,
           response_type: 'code',
@@ -214,6 +227,7 @@ module Sso
           code_challenge: code_challenge,
           code_challenge_method: 'S256'
         }
+        query[:prompt] = prompt if prompt.present?
         "#{discovery.fetch('authorization_endpoint')}?#{query.to_query}"
       end
 

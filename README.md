@@ -42,6 +42,7 @@ Staff sign in via Microsoft Entra ID (Azure AD). The community DocuSeal image do
 - Archived DocuSeal users are not silently unarchived; they're refused with a message and require admin action.
 - Users can set their own password later via the standard "Forgot password?" flow (only reachable when `SSO_ENFORCE=false` or `SSO_BREAK_GLASS=true`).
 - Public signing routes (`/d/`, `/s/`, `/p/`) are untouched — external counterparties never see any of this.
+- **Testing with a different account**: visit `/auth/entra?prompt=select_account` to force Microsoft's account picker (instead of silent SSO into whichever Microsoft account the browser already has a session for). Whitelisted `prompt` values: `login`, `select_account`, `consent`. `prompt=none` is deliberately not accepted.
 
 ### Environment variables (in `/opt/docuseal/.env`, not in this repo)
 

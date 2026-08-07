@@ -1,0 +1,47 @@
+<%# ICODOS sign-in page. Primary CTA is Microsoft SSO; the password form stays %>
+<%# available as a fallback for break-glass access. When SSO_ENFORCE=true this %>
+<%# page auto-redirects to /auth/entra before rendering (via zz_sso_entra.rb), %>
+<%# so users only see this template when password login is intentionally allowed. %>
+<%= content_for(:canonical_url, new_user_session_url) %>
+<div class="max-w-lg mx-auto px-4">
+  <%= render 'devise/shared/select_server' if Docuseal.multitenant? %>
+
+  <div class="text-center mt-10 mb-8">
+    <img src="/icodos-logo.png" alt="ICODOS" style="height: 3.5rem; width: auto;" class="mx-auto">
+    <h1 class="text-3xl font-bold mt-6">Sign in to ICODOS</h1>
+  </div>
+
+  <a href="/auth/entra" class="base-button block text-center text-lg">
+    Sign in with Microsoft
+  </a>
+  <p class="text-sm text-gray-500 mt-2 text-center">
+    Use your ICODOS Microsoft account.
+  </p>
+
+  <div class="flex items-center my-8" aria-hidden="true">
+    <div class="flex-grow border-t border-gray-300"></div>
+    <span class="mx-4 text-xs uppercase tracking-wider text-gray-400">or password</span>
+    <div class="flex-grow border-t border-gray-300"></div>
+  </div>
+
+  <%= form_for(resource, as: resource_name, html: { class: 'space-y-6' }, data: { turbo: params[:redir].blank? }, url: session_path(resource_name)) do |f| %>
+    <%= render 'hidden_fields' %>
+    <div class="space-y-2" dir="auto">
+      <div class="form-control">
+        <%= f.label :email, t(:email), class: 'label' %>
+        <%= f.email_field :email, autocomplete: 'email', class: 'base-input' %>
+      </div>
+      <div class="form-control">
+        <%= f.label :password, t(:password), class: 'label' %>
+        <%= f.password_field :password, autocomplete: 'current-password', class: 'base-input' %>
+      </div>
+    </div>
+    <div class="form-control">
+      <%= f.button button_title(title: t(:sign_in), disabled_with: t(:signing_in)), class: 'base-button' %>
+    </div>
+  <% end %>
+
+  <%= render 'omniauthable' %>
+  <%= render 'extra_links' %>
+  <%= render 'devise/shared/links' %>
+</div>

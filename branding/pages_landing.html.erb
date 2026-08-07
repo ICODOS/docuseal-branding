@@ -1,0 +1,31 @@
+<%# ICODOS landing page — shown at / for unauthenticated visitors. %>
+<%# Signed-in staff go to the dashboard directly; external counterparties %>
+<%# hit /d/ or /s/ signing links and never see this page. %>
+<%= content_for(:canonical_url, root_url) %>
+<section class="flex items-center justify-center min-h-[65vh]">
+  <div class="max-w-lg mx-auto px-4 text-center">
+    <img src="/icodos-logo.png" alt="ICODOS" style="height: 5rem; width: auto;" class="mx-auto">
+
+    <h1 class="text-3xl font-bold mt-10 mb-4">Document Signing</h1>
+
+    <p class="text-lg text-gray-600 mb-10">
+      Internal document signing for ICODOS staff.
+    </p>
+
+    <a href="/auth/entra" class="base-button block text-lg">
+      Sign in with Microsoft
+    </a>
+
+    <p class="mt-6 text-sm text-gray-500">
+      External signers: check your email for a personal signing link — you don't need to sign in here.
+    </p>
+
+    <p class="mt-4 text-xs text-gray-400">
+      <a href="<%= new_user_session_path %>" class="link">Other sign-in options</a>
+    </p>
+  </div>
+</section>
+
+<div class="text-center text-xs text-gray-400 pb-6">
+  Powered by <a href="https://github.com/docusealco/docuseal" target="_blank" rel="noopener" class="link">DocuSeal</a>
+</div>

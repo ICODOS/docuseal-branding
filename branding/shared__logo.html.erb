@@ -1,0 +1,17 @@
+<%
+  # ICODOS logo override for shared/_logo. Mirrors the local_assigns API of the
+  # stock DocuSeal partial (width, height, class) so every caller keeps working.
+  klass = local_assigns[:class]
+  w = local_assigns[:width]
+  h = local_assigns[:height]
+  css = []
+  css << "width: #{w.to_s.match?(/[a-z%]/i) ? w : "#{w}px"}" if w
+  css << "height: #{h.to_s.match?(/[a-z%]/i) ? h : "#{h}px"}" if h
+  # If the caller didn't pass width/height AND didn't pass tailwind sizing classes,
+  # default to 37px height matching the stock DocuSeal logo footprint in headers.
+  if css.empty? && (klass.to_s !~ /\b[wh]-\d/)
+    css << 'height: 37px'
+    css << 'width: auto'
+  end
+%>
+<img src="/icodos-logo.png" alt="ICODOS" class="<%= klass %>" style="<%= css.join('; ') %>">

@@ -20,6 +20,10 @@ services:
       - ./branding/mailer_attribution.html.erb:/app/app/views/shared/_mailer_attribution.html.erb:ro
       - ./branding/head_tags.html.erb:/app/app/views/layouts/_head_tags.html.erb:ro
       - ./branding/icodos-logo.png:/app/public/icodos-logo.png:ro
+      - ./branding/shared__logo.html.erb:/app/app/views/shared/_logo.html.erb:ro
+      - ./branding/shared__title.html.erb:/app/app/views/shared/_title.html.erb:ro
+      - ./branding/pages_landing.html.erb:/app/app/views/pages/landing.html.erb:ro
+      - ./branding/devise_sessions_new.html.erb:/app/app/views/devise/sessions/new.html.erb:ro
       - ./sso/entra_auth_controller.rb:/app/app/controllers/sso/entra_auth_controller.rb:ro
       - ./sso/zz_sso_entra.rb:/app/config/initializers/zz_sso_entra.rb:ro
     environment:

@@ -11,6 +11,10 @@ Branding overlay for our self-hosted [DocuSeal](https://github.com/docusealco/do
 | `branding/mailer_attribution.html.erb` | Empties the "Sent using DocuSeal" footer in all outgoing emails (see license note below) |
 | `branding/head_tags.html.erb` | Browser tab title: "ICODOS – Document Signing" instead of "DocuSeal \| Open Source Document Signing" |
 | `branding/icodos-logo.png` | ICODOS logo (black, transparent background) served at `/icodos-logo.png` |
+| `branding/shared__logo.html.erb` | Overrides the shared logo partial used across the app (top-left header, landing hero, upload spinner, etc.) — replaces the DocuSeal SVG with the ICODOS logo |
+| `branding/shared__title.html.erb` | Drops the literal "DocuSeal" text next to the header logo (the ICODOS logo image already contains the wordmark) |
+| `branding/pages_landing.html.erb` | Replaces the DocuSeal marketing landing at `/` with a plain ICODOS "Sign in with Microsoft" page |
+| `branding/devise_sessions_new.html.erb` | Rewrites `/sign_in` — Microsoft SSO is the primary CTA, password form stays as fallback for break-glass |
 | `sso/entra_auth_controller.rb` | OIDC controller for Microsoft Entra SSO — `/auth/entra` and `/auth/entra/callback` |
 | `sso/zz_sso_entra.rb` | Initializer that registers the SSO routes and enforces password-login blocking |
 | `docker-compose.yml` | Stock compose file plus the overlay mounts, SSO env vars, and a pinned image version |

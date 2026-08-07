@@ -233,6 +233,13 @@ This layer went through two independent adversarial reviews before being enabled
 | A grant minted during a Pretender impersonation session would outlive it | Refused while impersonating |
 | The authorization endpoint response was cacheable and relied on a framework default for anti-framing | `no-store`, `X-Frame-Options: DENY` and `frame-ancestors 'none'` set explicitly |
 
+Two mistakes surfaced only against the real Claude connector, after the reviews:
+
+- **`form-action 'self'` blocked the authorization hand-back.** Added while addressing the anti-framing finding above. The consent form posts to `'self'`, but that POST answers with a 302 to the client's `redirect_uri`, and Chrome/WebKit enforce `form-action` across the redirect chain following a form submission. The browser silently dropped the navigation carrying the authorization code. Nothing was visible server-side — the log showed a successful grant and simply no token exchange ever followed. `form-action` now lists the redirect-host allowlist alongside `'self'`.
+- **A duplicate consent submission reported success as failure.** Clicking Allow a second time while the first was still redirecting hit the single-use consent guard, which rendered "Authorization failed — nothing was granted" *after* the authorization had already completed. The guard now records the decision, so a repeat submission is answered truthfully ("Already authorized", HTTP 200) instead of as an error.
+
+Both are worth knowing about because both were introduced by security hardening and neither was detectable from the server side alone.
+
 One reviewer claim did **not** survive checking: that the IP-based rate limits were bypassable by spoofing `X-Forwarded-For`. Behind this deployment's Caddy they are not — Caddy appends the real peer address and `ActionDispatch` takes the rightmost non-private entry, so a spoofed prefix is ignored. Verified against the running stack. That would stop being true if Caddy were swapped for a proxy that overwrites the header instead of appending.
 
 Both reviewers independently flagged the absence of per-grant revocation; see "Known limitations" above for why that stands and what it would take to change.

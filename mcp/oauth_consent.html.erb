@@ -10,7 +10,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
-<title><%= @fatal_message ? 'Authorization failed' : 'Authorize access' %> – ICODOS Document Signing</title>
+<title><%= @notice_heading || 'Authorize access' %> – ICODOS Document Signing</title>
 <style>
   :root { color-scheme: light dark; --bg:#f4f4f5; --card:#ffffff; --ink:#18181b; --muted:#52525b;
           --line:#e4e4e7; --accent:#18181b; --accent-ink:#ffffff; --warn-bg:#fef3c7; --warn-ink:#78350f; }
@@ -49,10 +49,10 @@
 <div class="card">
   <img class="logo" src="/icodos-logo.png" alt="ICODOS">
 
-  <% if @fatal_message %>
-    <h1>Authorization failed</h1>
-    <p class="lead"><%= @fatal_message %></p>
-    <p>Nothing was granted. You can close this window.</p>
+  <% if @notice_message %>
+    <h1><%= @notice_heading %></h1>
+    <p class="lead"><%= @notice_message %></p>
+    <% if @notice_tail.present? %><p><%= @notice_tail %></p><% end %>
   <% else %>
     <h1>Authorize access to your DocuSeal account</h1>
 

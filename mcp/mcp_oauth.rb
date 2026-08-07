@@ -725,11 +725,26 @@ module McpOauth
   # — the initializer warns at boot if that happens. Replay is additionally
   # bounded by the 60s code lifetime, PKCE, and redirect_uri binding.
   def consume_jti!(jti, ttl:)
-    return false if jti.to_s.empty?
+    consume_decision!(jti, true, ttl: ttl) == :first
+  end
+
+  # Same single-use guarantee as consume_jti!, but it records WHAT the answer was.
+  # Returns :first when this call won the race, otherwise the value stored by
+  # whoever won.
+  #
+  # This exists so a duplicate consent submission can be told "you already
+  # approved this, it completed" rather than "authorization failed, nothing was
+  # granted". The latter is what a second click on Allow used to produce, and it
+  # is actively misleading: on that path the authorization had in fact succeeded
+  # a fraction of a second earlier.
+  def consume_decision!(jti, decision, ttl:)
+    return :replay if jti.to_s.empty?
 
     key = "mcp_oauth:jti:#{Digest::SHA256.hexdigest(jti.to_s)}"
+    return :first if Rails.cache.write(key, decision, unless_exist: true, expires_in: [ttl.to_i, 60].max)
 
-    Rails.cache.write(key, true, unless_exist: true, expires_in: [ttl.to_i, 60].max) ? true : false
+    stored = Rails.cache.read(key)
+    stored.nil? ? :replay : stored
   end
 
   # -------------------------------------------------- resource-server validation

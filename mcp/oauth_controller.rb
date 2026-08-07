@@ -163,13 +163,23 @@ module Sso
       # Single use, whichever way the user decides. Without this the same signed
       # consent token could be POSTed repeatedly for its whole 600s life, minting
       # a fresh code each time — and a Deny would be undone by the back button.
-      unless McpOauth.consume_jti!(pending['jti'],
-                                   ttl: McpOauth::AUTHZ_REQUEST_TTL + McpOauth::JWT_LEEWAY + 240)
-        Rails.logger.warn('[mcp-oauth] consent token reuse refused')
-        return fatal('This authorization request has already been answered. Please start again from Claude.')
+      #
+      # The decision is recorded rather than just a flag, so a duplicate
+      # submission can be answered accurately. A second click on Allow while the
+      # first was still redirecting is the common case by far, and it must not be
+      # reported as a failure — by the time it arrives the authorization has
+      # usually already completed.
+      decision = params[:decision].to_s == 'allow' ? 'allow' : 'deny'
+      outcome  = McpOauth.consume_decision!(
+        pending['jti'], decision, ttl: McpOauth::AUTHZ_REQUEST_TTL + McpOauth::JWT_LEEWAY + 240
+      )
+
+      unless outcome == :first
+        Rails.logger.info("[mcp-oauth] duplicate consent submission ignored (already answered: #{outcome})")
+        return already_answered(outcome)
       end
 
-      unless params[:decision].to_s == 'allow'
+      unless decision == 'allow'
         Rails.logger.info("[mcp-oauth] user_id=#{current_user.id} denied consent")
         return deny(redirect_uri, state, 'access_denied', 'The user denied the request.')
       end
@@ -289,9 +299,28 @@ module Sso
     # unregistered redirect_uri, expired consent) — reporting those by redirect
     # would turn this endpoint into an open redirector.
     def fatal(message)
-      @fatal_message = message
+      @notice_heading = 'Authorization failed'
+      @notice_message = message
+      @notice_tail    = 'Nothing was granted. You can close this window.'
 
       render :consent, status: :bad_request
+    end
+
+    # A duplicate submission of the same consent form. The first answer stands;
+    # report it truthfully. Not an error, so not a 4xx.
+    def already_answered(previous)
+      if previous == 'deny'
+        @notice_heading = 'Request already declined'
+        @notice_message = 'You already declined this request. Nothing was granted.'
+        @notice_tail    = 'You can close this window.'
+      else
+        @notice_heading = 'Already authorized'
+        @notice_message = 'You already approved this request and it completed successfully. ' \
+                          'This second attempt was ignored — no additional access was granted.'
+        @notice_tail    = 'You can close this window and go back to Claude.'
+      end
+
+      render :consent, status: :ok
     end
 
     # Safe because `uri` is always a redirect_uri already matched against the

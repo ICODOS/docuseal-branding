@@ -176,16 +176,23 @@ module Sso
       [email.split('@').first.presence, nil]
     end
 
-    # Whitelist the OIDC `prompt` parameter to the three safe interactive
-    # values. Deliberately blocks `prompt=none` (silent auth that errors on
-    # any required interaction) since we want callers to always see a UI
-    # when they pass a prompt at all.
-    def sanitized_prompt(raw)
-      return nil if raw.blank?
-      value = raw.to_s
-      return value if %w[login select_account consent].include?(value)
+    # OIDC `prompt` handling.
+    # Default: `select_account` — Microsoft always shows the account picker
+    # so a user can pick which Microsoft account to sign in with, even if
+    # they already have an active session in the browser. The tradeoff is
+    # one extra click per sign-in; the benefit is that account switching
+    # never gets silently short-circuited by a stale browser session.
+    # Explicit override via ?prompt= is honored against a small whitelist.
+    # `prompt=none` (silent auth that errors on any required interaction)
+    # is deliberately not accepted.
+    DEFAULT_PROMPT   = 'select_account'
+    ALLOWED_PROMPTS  = %w[login select_account consent].freeze
 
-      nil
+    def sanitized_prompt(raw)
+      value = raw.to_s
+      return value if ALLOWED_PROMPTS.include?(value)
+
+      DEFAULT_PROMPT
     end
 
     def safe_return_to(param)

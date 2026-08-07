@@ -206,9 +206,37 @@ module Sso
     def set_consent_response_headers
       response.headers['Cache-Control'] = 'no-store'
       response.headers['X-Frame-Options'] = 'DENY'
-      response.headers['Content-Security-Policy'] =
-        "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; " \
-        "form-action 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'"
+      response.headers['Content-Security-Policy'] = consent_csp
+    end
+
+    # `form-action` MUST list the hosts we are allowed to redirect the
+    # authorization response to, not just 'self'.
+    #
+    # The consent form posts to 'self', but that POST answers with a 302 to the
+    # client's redirect_uri. Chrome and WebKit enforce form-action against the
+    # redirect chain that follows a form submission, so `form-action 'self'`
+    # silently blocks the navigation carrying the authorization code — the server
+    # logs a successful grant, the browser never reaches the client, and no token
+    # exchange ever happens. There is no server-side trace of the failure.
+    #
+    # Restricting it to the redirect-host allowlist keeps the directive
+    # meaningful: the consent form still cannot be repointed at an arbitrary
+    # origin, but the legitimate hand-back works.
+    def consent_csp
+      targets = McpOauth.allowed_redirect_hosts.map do |host|
+        # CSP source expressions need IPv6 literals bracketed.
+        bracketed = host.include?(':') ? "[#{host}]" : host
+
+        McpOauth.loopback_host?(host) ? "http://#{bracketed}:*" : "https://#{bracketed}"
+      end
+
+      ["default-src 'self'",
+       "style-src 'self' 'unsafe-inline'",
+       "img-src 'self'",
+       "form-action 'self' #{targets.join(' ')}".rstrip,
+       "frame-ancestors 'none'",
+       "base-uri 'none'",
+       "object-src 'none'"].join('; ')
     end
 
     # Two gates, both required before we will mint a grant:

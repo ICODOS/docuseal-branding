@@ -1,0 +1,117 @@
+<%#
+  Consent screen for the ICODOS MCP OAuth authorization endpoint, and the error
+  card for failures that must not be reported back to the client by redirect.
+
+  Deliberately self-contained (rendered with `layout false`, styles inline) so an
+  upstream DocuSeal layout or asset change cannot break the OAuth flow. Inline
+  <style> is permitted by the app's CSP (style_src :self, :unsafe_inline); no
+  inline scripts are used.
+%><!-- ICODOS MCP OAuth consent — https://github.com/ICODOS/docuseal-branding -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title><%= @fatal_message ? 'Authorization failed' : 'Authorize access' %> – ICODOS Document Signing</title>
+<style>
+  :root { color-scheme: light dark; --bg:#f4f4f5; --card:#ffffff; --ink:#18181b; --muted:#52525b;
+          --line:#e4e4e7; --accent:#18181b; --accent-ink:#ffffff; --warn-bg:#fef3c7; --warn-ink:#78350f; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#18181b; --card:#27272a; --ink:#fafafa; --muted:#a1a1aa;
+            --line:#3f3f46; --accent:#fafafa; --accent-ink:#18181b; --warn-bg:#422006; --warn-ink:#fde68a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px;
+         background:var(--bg); color:var(--ink);
+         font:16px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  .card { width:100%; max-width:460px; background:var(--card); border:1px solid var(--line);
+          border-radius:14px; padding:32px; }
+  .logo { height:26px; width:auto; margin-bottom:24px; }
+  h1 { font-size:20px; line-height:1.3; margin:0 0 8px; font-weight:600; }
+  p { margin:0 0 16px; color:var(--muted); font-size:14px; }
+  p.lead { color:var(--ink); font-size:15px; }
+  dl { margin:0 0 20px; border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  dt { font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin-top:12px; }
+  dt:first-child { margin-top:0; }
+  dd { margin:2px 0 0; font-size:14px; word-break:break-all; }
+  ul { margin:0; padding-left:20px; font-size:14px; }
+  li { margin-bottom:4px; }
+  .warn { background:var(--warn-bg); color:var(--warn-ink); border-radius:10px; padding:12px 14px;
+          font-size:13px; margin:0 0 20px; }
+  p.caution { font-size:13px; color:var(--muted); border-left:3px solid var(--line); padding-left:12px; }
+  .actions { display:flex; gap:10px; margin-top:4px; }
+  button { flex:1; font:inherit; font-size:15px; font-weight:500; padding:11px 16px; border-radius:9px;
+           cursor:pointer; border:1px solid var(--line); }
+  button.allow { background:var(--accent); color:var(--accent-ink); border-color:var(--accent); }
+  button.deny { background:transparent; color:var(--ink); }
+  .foot { margin:22px 0 0; padding-top:16px; border-top:1px solid var(--line); font-size:12.5px; color:var(--muted); }
+  a { color:inherit; }
+</style>
+
+<div class="card">
+  <img class="logo" src="/icodos-logo.png" alt="ICODOS">
+
+  <% if @fatal_message %>
+    <h1>Authorization failed</h1>
+    <p class="lead"><%= @fatal_message %></p>
+    <p>Nothing was granted. You can close this window.</p>
+  <% else %>
+    <h1>Authorize access to your DocuSeal account</h1>
+
+    <p class="lead">
+      An application calling itself <strong><%= @client.name %></strong> is asking
+      to use the ICODOS DocuSeal MCP server as you. If you allow it, it will act
+      with your own DocuSeal permissions &mdash; including sending documents for
+      signature.
+    </p>
+
+    <p class="caution">
+      That name is supplied by the application itself and has not been verified by
+      ICODOS. Judge this request by where it sends the authorization, below, and by
+      whether you started it yourself just now.
+    </p>
+
+    <dl>
+      <dt>Signed in as</dt>
+      <dd><%= current_user.email %></dd>
+
+      <dt>Authorization will be sent to</dt>
+      <dd><%= @redirect_uri %></dd>
+
+      <dt>Resource</dt>
+      <dd><%= @resource %></dd>
+    </dl>
+
+    <% if @loopback %>
+      <div class="warn">
+        This request returns the authorization to <strong><%= @redirect_host %></strong>,
+        an application running on your own computer. Only continue if you started
+        this from an application you trust on this machine &mdash; any local
+        program can claim that address.
+      </div>
+    <% end %>
+
+    <p>This grants:</p>
+    <ul>
+      <% if @scopes.include?(McpOauth::SCOPE_MCP) %>
+        <li>Read and use your DocuSeal templates and documents through MCP tools,
+            including sending documents for signature, as <%= current_user.email %>.</li>
+      <% end %>
+      <% if @scopes.include?(McpOauth::SCOPE_OFFLINE) %>
+        <li>Stay connected without re-authorizing, for up to
+            <%= (McpOauth.refresh_token_ttl / 86_400) %> days.</li>
+      <% end %>
+    </ul>
+
+    <form method="post" action="/oauth/authorize">
+      <input type="hidden" name="authenticity_token" value="<%= form_authenticity_token %>">
+      <input type="hidden" name="authorization_request" value="<%= @authorization_request %>">
+      <div class="actions">
+        <button type="submit" name="decision" value="deny" class="deny">Deny</button>
+        <button type="submit" name="decision" value="allow" class="allow">Allow</button>
+      </div>
+    </form>
+
+    <p class="foot">
+      Not the right account? <a href="<%= @switch_account %>">Sign in with a different Microsoft account</a>.
+    </p>
+  <% end %>
+</div>

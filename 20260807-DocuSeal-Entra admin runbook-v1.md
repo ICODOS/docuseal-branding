@@ -4,7 +4,7 @@
 **Server:** `root@31.70.107.24` (IONOS VPS, stack in `/opt/docuseal`)
 **Overlay repo (this repo):** https://github.com/ICODOS/docuseal-branding
 
-This runbook covers the two recurring operational tasks — adding/removing staff, and rotating the Entra client secret — plus the break-glass procedure and periodic checks. Written for an admin sitting in the Azure Portal with SSH access to the VPS.
+This runbook covers the recurring operational tasks — adding/removing staff, rotating the Entra client secret, and running the MCP OAuth connector (section 7) — plus the break-glass procedure and periodic checks. Written for an admin sitting in the Azure Portal with SSH access to the VPS.
 
 If you also need the original *setup* guide (one-time Azure app registration, `.env` seeding, deployment from scratch), that's a separate file the person who initially deployed this instance kept locally. Everything below assumes the instance is already running and configured.
 
@@ -37,7 +37,7 @@ If you also need the original *setup* guide (one-time Azure app registration, `.
 After the person signs in, in DocuSeal go to **Settings → Users**. The new user should be listed with correct name and email. Server-side you can also confirm:
 
 ```bash
-ssh root@31.70.127.24
+ssh root@31.70.107.24
 docker compose -f /opt/docuseal/docker-compose.yml logs --tail 200 app | grep -i "auto-provisioned"
 ```
 
@@ -212,12 +212,183 @@ Not an SSO problem. DocuSeal itself is refusing the action. Usually means the us
 
 ---
 
-## 7. Reference
+## 7. MCP OAuth connector (Phase D)
+
+**What this is.** `https://sign.icodos.com/mcp` accepts two kinds of credential. The old one is a static Bearer token you create in **Settings → MCP** — one token, shared by whoever holds it. The new one is OAuth 2.1, which is what Claude's admin-managed custom connectors require, and which makes each tool call run as a *specific* DocuSeal user. Both work at the same time. Static tokens are tried first, so they cannot be affected by anything in the OAuth path.
+
+Design notes and the full endpoint list are in the overlay repo's `README.md`, "Phase D" section. This section is only the operational procedures.
+
+### 7a. Turn it on
+
+The code ships disabled. To enable:
+
+```bash
+ssh root@31.70.107.24
+cd /opt/docuseal
+
+# 1. The signing key must exist first — Docker creates a *directory* in place of a
+#    missing bind-mount source, which would silently leave the layer disabled.
+ls -l secrets/mcp_oauth_signing_key.pem     # should be -r-------- owned by 2000:2000
+
+# 2. Add one line to .env
+echo 'MCP_OAUTH_ENABLED=true' >> .env
+
+# 3. Apply
+docker compose up -d app
+```
+
+Confirm it came up enabled:
+
+```bash
+docker compose logs app --since 2m | grep mcp-oauth
+# want: [mcp-oauth] enabled. issuer=https://sign.icodos.com resource=https://sign.icodos.com/mcp kid=...
+# NOT:  [mcp-oauth] disabled ...
+# NOT:  [mcp-oauth] MCP_OAUTH_ENABLED=true but the signing key is unusable ...
+```
+
+### 7b. Smoke check (run after any enable, key rotation, or DocuSeal version bump)
+
+```bash
+# 1. Discovery documents exist and are well formed
+curl -s https://sign.icodos.com/.well-known/oauth-protected-resource | python3 -m json.tool
+curl -s https://sign.icodos.com/.well-known/oauth-authorization-server | python3 -m json.tool
+
+# 2. Unauthenticated /mcp must 401 *and* carry the discovery pointer.
+#    Without this header Claude never finds the authorization server.
+curl -s -i -X POST https://sign.icodos.com/mcp \
+  -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","method":"tools/list","id":1}' \
+  | grep -i -E '^HTTP/|www-authenticate'
+# want: 401, and www-authenticate: Bearer resource_metadata="https://sign.icodos.com/.well-known/oauth-protected-resource", scope="mcp"
+
+# 3. The JWKS must contain public key material only — no "d", "p" or "q"
+curl -s https://sign.icodos.com/oauth/jwks.json | python3 -m json.tool
+
+# 4. An existing static token still works (backward compatibility)
+curl -s -X POST https://sign.icodos.com/mcp -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <a-token-from-Settings-MCP>' \
+  -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'
+# want: the tool list
+```
+
+### 7c. Add the connector in Claude
+
+An admin adds a custom connector pointing at `https://sign.icodos.com/mcp`. Leave the **OAuth Client ID** and **OAuth Client Secret** fields empty — Claude registers itself automatically via dynamic client registration, and this authorization server issues public clients only, so there is no secret to supply.
+
+On connect, each user is sent to Microsoft to sign in (if they don't already have a DocuSeal session in that browser), then sees an ICODOS consent screen naming their DocuSeal account and the host the authorization will be sent to. After **Allow**, their tools work as that DocuSeal identity.
+
+Users need to reconnect at most every 14 days — that's the absolute lifetime of the grant, and rotation does not extend it. Re-authorizing is two clicks when they're already signed in to Microsoft.
+
+**Claude Code and other local MCP clients will not connect** as configured. Redirect URIs are restricted to `claude.ai` and `claude.com`; loopback addresses (`localhost`, `127.0.0.1`) are excluded on purpose, because any program on a user's machine could otherwise register itself and phish a one-click grant. If you later need a local client, add the hosts to `MCP_OAUTH_ALLOWED_REDIRECT_HOSTS` in `.env` and understand that you are accepting that risk.
+
+### 7d. Revoke one person's access
+
+**Someone is leaving.** Archive their DocuSeal user (section 2, step 2) and remove their Entra assignment (section 2, step 1). Archiving takes effect on the **next request** — every `/mcp` call and every token refresh re-checks that the account is still active.
+
+**You suspect a specific connector was compromised** (stolen laptop, malware, a token pasted somewhere it shouldn't be). Archiving alone is not enough here, and this is worth understanding before you need it:
+
+> Grants are stateless signed tokens, not database rows. Archiving the user makes every existing token stop working immediately — but it **suspends** rather than destroys them. If you later un-archive that user and their refresh token is still inside its 14-day window, it starts working again.
+
+So for a suspected compromise, do both:
+
+1. Archive the user (immediate effect), and
+2. **rotate the signing key** (7e) — the only action that truly destroys issued grants.
+
+There is no per-grant revoke button, by design: the stateless approach was chosen deliberately so that nothing is written to the database holding your executed contracts. The trade-off is exactly this. If it turns out to matter in practice, tell whoever maintains the overlay — adding a small revocation table is a contained change.
+
+**Turning MCP off for the whole account** (Settings → MCP) also blocks every OAuth grant on the next request, and is the fastest blunt instrument if you don't yet know which user is affected.
+
+### 7e. Rotate the signing key
+
+Rotating invalidates every issued token **and** every registered OAuth client, because the client-ID authentication key is derived from the signing key. Every connector has to be reconnected in Claude afterwards. Static Bearer tokens are unaffected.
+
+Do this if you suspect the key was exposed, or on a schedule if you want one (there's no expiry forcing it).
+
+```bash
+ssh root@31.70.107.24
+cd /opt/docuseal
+
+# 1. Keep the old key so tokens already issued keep verifying during the overlap
+mv secrets/mcp_oauth_signing_key.pem secrets/mcp_oauth_signing_key.previous.pem
+
+# 2. New key
+openssl genrsa -out secrets/mcp_oauth_signing_key.pem 3072
+chown 2000:2000 secrets/mcp_oauth_signing_key.pem
+chmod 400 secrets/mcp_oauth_signing_key.pem
+
+# 3. Publish the old public key alongside the new one during the overlap.
+#    Add the mount to docker-compose.yml, in the Phase D block:
+#      - ./secrets/mcp_oauth_signing_key.previous.pem:/app/config/icodos/mcp_oauth_previous_key.pem:ro
+#    and add to .env:
+#      MCP_OAUTH_PREVIOUS_SIGNING_KEY_PATH=/app/config/icodos/mcp_oauth_previous_key.pem
+docker compose up -d app
+docker compose logs app --since 2m | grep mcp-oauth      # new kid= should appear
+
+# 4. Reconnect the connector in Claude (it re-registers itself).
+# 5. After ~2 hours (longer than the 1h access-token lifetime), drop the overlap:
+#    remove MCP_OAUTH_PREVIOUS_SIGNING_KEY_PATH from .env, remove the extra mount,
+#    docker compose up -d app, then shred the old key.
+shred -u secrets/mcp_oauth_signing_key.previous.pem
+```
+
+If you don't care about the overlap — simplest and fine for a hard rotation — skip steps 1, 3 and 5: just replace the key, restart, and reconnect. Everyone re-authorizes.
+
+### 7f. Roll back
+
+**Fast rollback — one line, no file changes.** OAuth off, static Bearer tokens keep working exactly as before Phase D:
+
+```bash
+ssh root@31.70.107.24
+cd /opt/docuseal
+# set MCP_OAUTH_ENABLED=false in .env (or delete the line)
+docker compose up -d app
+```
+
+All eight OAuth endpoints then return 404 and the `/mcp` 401 loses its `WWW-Authenticate` header, which is exactly the pre-Phase-D response. Verified. Any connector using OAuth stops working immediately, so tell users first.
+
+**Full rollback — remove the code too.** Delete the single comment-delimited block from `docker-compose.yml`:
+
+```
+# --- Phase D: MCP OAuth 2.1 (delete this whole block to remove the code) ---
+   ... five mounts plus the signing key mount ...
+# --- end Phase D ---
+```
+
+Delete all of it, not parts — the initializer registers routes naming controllers that would otherwise be missing. Then `docker compose up -d app`. (Leaving the `MCP_OAUTH_*` environment lines in place is harmless.)
+
+### 7g. Troubleshooting
+
+**Claude says "Couldn't reach the MCP server" and the authorization server sees no traffic.**
+Discovery failed. Run smoke check steps 1 and 2. The usual cause is a missing `WWW-Authenticate` header on the 401, which happens when `MCP_OAUTH_ENABLED` isn't `true`.
+
+**Boot log says "the signing key is unusable".**
+Either the file is missing, or it isn't readable by the app process, which runs as uid 2000 inside the container — a root-owned mode-600 file is *not* readable by it. Fix with `chown 2000:2000` and `chmod 400`. The layer stays off until this is resolved; static tokens are unaffected. Also check that `secrets/mcp_oauth_signing_key.pem` is a file and not a directory Docker created.
+
+**Boot log says "could not install the /mcp authentication hook".**
+Either a partial rollback (the initializer is mounted but `mcp/mcp_oauth.rb` isn't), or a DocuSeal upgrade changed `app/controllers/mcp/mcp_base_controller.rb`. OAuth tokens are refused; static tokens still work. See the README's "Updating DocuSeal itself" checklist.
+
+**A user gets "Your account has been archived."**
+Same cause and same fix as the SSO version of this message — see section 6. It's the identical rule, deliberately.
+
+**"Unknown OAuth client" on the consent page.**
+The client registration no longer verifies, normally because the signing key was rotated. Remove and re-add the connector in Claude so it registers again.
+
+**Users are asked to reconnect more often than every 14 days.**
+Access tokens last an hour and are refreshed automatically. If reconnection is being demanded more often, check the container isn't restarting frequently — the refresh-token reuse guard lives in process memory, and a restart can invalidate an in-flight rotated token, which surfaces as one reconnect prompt.
+
+**A connector fails to register with HTTP 429.**
+Registration is rate limited to 20 attempts per hour per source IP. Normal use registers once per connection, so this usually means something is retrying in a loop. Wait an hour, or check the logs for what is hammering it.
+
+**I want to see who is using OAuth.**
+`docker compose logs app | grep 'mcp-oauth'`. Successful calls log `/mcp authorized user_id=… client=… scope=…`. Tokens are never logged.
+
+---
+
+## 8. Reference
 
 - Overlay repo: https://github.com/ICODOS/docuseal-branding
-- Design notes: see the overlay repo's `README.md`, "Microsoft Entra SSO overlay" section.
+- Design notes: see the overlay repo's `README.md`, "Microsoft Entra SSO overlay" and "Phase D — MCP endpoint speaks OAuth 2.1" sections.
 - Upstream DocuSeal: https://github.com/docusealco/docuseal (AGPL-3.0). Version pinned in `docker-compose.yml`.
 - Entra Enterprise Application: Azure Portal → Microsoft Entra ID → Enterprise applications → ICODOS DocuSeal.
 - Entra App registration (secrets, redirect URIs, API permissions): Azure Portal → Microsoft Entra ID → App registrations → ICODOS DocuSeal.
 
-Last updated: 2026-08-07.
+Last updated: 2026-08-07 (added section 7, MCP OAuth connector).

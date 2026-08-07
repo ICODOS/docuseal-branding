@@ -1,0 +1,8 @@
+# Private key material for the Phase D MCP OAuth authorization server.
+# These files live only on the server, mounted read-only into the container.
+# Never commit them.
+secrets/
+*.pem
+*.key
+
+.DS_Store

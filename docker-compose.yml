@@ -2,6 +2,12 @@
 # Based on the original /opt/docuseal/docker-compose.yml, with:
 #   1. Image pinned to a tested version (no surprise updates that could break the view overrides)
 #   2. Branding overlay files mounted over the stock views (see ./branding)
+#   3. Microsoft Entra SSO overlay (see ./sso)
+#   4. Phase D — MCP OAuth 2.1 authorization server (see ./mcp)
+#
+# NOTE: ./secrets/mcp_oauth_signing_key.pem must exist BEFORE the first
+# `docker compose up -d`. Docker creates a directory in place of a missing
+# bind-mount source, which would leave the OAuth layer disabled. See README.
 #
 # Modified views are published at: https://github.com/ICODOS/docuseal-branding
 # (AGPL-3.0 compliance — DocuSeal attribution retained per LICENSE_ADDITIONAL_TERMS)
@@ -27,6 +33,19 @@ services:
       - ./branding/devise_sessions_new.html.erb:/app/app/views/devise/sessions/new.html.erb:ro
       - ./sso/entra_auth_controller.rb:/app/app/controllers/sso/entra_auth_controller.rb:ro
       - ./sso/zz_sso_entra.rb:/app/config/initializers/zz_sso_entra.rb:ro
+      # --- Phase D: MCP OAuth 2.1 (delete this whole block to remove the code) ---
+      - ./mcp/mcp_oauth.rb:/app/lib/mcp_oauth.rb:ro
+      - ./mcp/oauth_api_controller.rb:/app/app/controllers/sso/oauth_api_controller.rb:ro
+      - ./mcp/oauth_controller.rb:/app/app/controllers/sso/oauth_controller.rb:ro
+      - ./mcp/oauth_consent.html.erb:/app/app/views/sso/oauth/consent.html.erb:ro
+      - ./mcp/zz_mcp_oauth.rb:/app/config/initializers/zz_mcp_oauth.rb:ro
+      # Signing key lives OUTSIDE this repo (./secrets is gitignored). Generate with:
+      #   mkdir -p secrets && chmod 700 secrets
+      #   openssl genrsa -out secrets/mcp_oauth_signing_key.pem 3072
+      #   chown 2000:2000 secrets/mcp_oauth_signing_key.pem   # the app runs as uid 2000, not root
+      #   chmod 400 secrets/mcp_oauth_signing_key.pem
+      - ./secrets/mcp_oauth_signing_key.pem:/app/config/icodos/mcp_oauth_signing_key.pem:ro
+      # --- end Phase D ---
     environment:
       - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/docuseal
       - FORCE_SSL=${HOST}
@@ -35,6 +54,15 @@ services:
       - ENTRA_CLIENT_SECRET=${ENTRA_CLIENT_SECRET:-}
       - SSO_ENFORCE=${SSO_ENFORCE:-false}
       - SSO_BREAK_GLASS=${SSO_BREAK_GLASS:-false}
+      # Phase D — MCP OAuth 2.1. Off unless MCP_OAUTH_ENABLED=true.
+      - MCP_OAUTH_ENABLED=${MCP_OAUTH_ENABLED:-false}
+      - MCP_OAUTH_SIGNING_KEY_PATH=${MCP_OAUTH_SIGNING_KEY_PATH:-/app/config/icodos/mcp_oauth_signing_key.pem}
+      - MCP_OAUTH_PREVIOUS_SIGNING_KEY_PATH=${MCP_OAUTH_PREVIOUS_SIGNING_KEY_PATH:-}
+      - MCP_OAUTH_ISSUER=${MCP_OAUTH_ISSUER:-}
+      - MCP_OAUTH_RESOURCE=${MCP_OAUTH_RESOURCE:-}
+      - MCP_OAUTH_ALLOWED_REDIRECT_HOSTS=${MCP_OAUTH_ALLOWED_REDIRECT_HOSTS:-}
+      - MCP_OAUTH_ACCESS_TOKEN_TTL=${MCP_OAUTH_ACCESS_TOKEN_TTL:-}
+      - MCP_OAUTH_REFRESH_TOKEN_TTL=${MCP_OAUTH_REFRESH_TOKEN_TTL:-}
 
   postgres:
     image: postgres:16

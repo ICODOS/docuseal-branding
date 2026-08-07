@@ -92,17 +92,19 @@ module Sso
         return fail_login('Microsoft sign-in did not return an email address.')
       end
 
-      user = User.active.where('LOWER(email) = ?', email).first
+      user = User.where('LOWER(email) = ?', email).first
+
       if user.nil?
-        Rails.logger.warn("[sso] no active DocuSeal user for entra email=#{email}")
-        return fail_login(
-          "Your Microsoft account (#{email}) isn't linked to a DocuSeal user. Contact your administrator."
-        )
+        user = provision_from_claims!(email, claims)
+        if user.nil?
+          return fail_login('Unable to create your DocuSeal account. Contact your administrator.')
+        end
       end
 
       unless user.active_for_authentication?
-        Rails.logger.warn("[sso] user id=#{user.id} not active_for_authentication")
-        return fail_login('Your account is not active. Contact your administrator.')
+        # Archived users don't get silently unarchived — that requires an admin.
+        Rails.logger.warn("[sso] user id=#{user.id} not active_for_authentication (archived?)")
+        return fail_login('Your account has been archived. Contact your administrator to restore access.')
       end
 
       reset_session
@@ -120,6 +122,57 @@ module Sso
 
     def callback_url
       url_for(action: :callback, only_path: false)
+    end
+
+    # Auto-provision a DocuSeal user for an Entra-authenticated caller that
+    # doesn't yet have one. The Entra Enterprise Application "Assignment
+    # required = Yes" gate is the effective ACL — reaching this point means
+    # the tenant admin has explicitly permitted this user to sign in.
+    #
+    # Password is random (user never sees it); they can set their own via
+    # the standard "Forgot password?" flow if password login is ever needed.
+    def provision_from_claims!(email, claims)
+      account = Account.active.first
+      if account.nil?
+        Rails.logger.error('[sso] auto-provision aborted: no active Account exists')
+        return nil
+      end
+
+      first_name, last_name = extract_name_from_claims(claims, email)
+
+      user = account.users.new(
+        email: email.downcase,
+        first_name: first_name,
+        last_name: last_name,
+        role: User::ADMIN_ROLE,
+        password: SecureRandom.hex(16)
+      )
+
+      if user.save
+        Rails.logger.info("[sso] auto-provisioned user id=#{user.id} email=#{user.email}")
+        user
+      else
+        Rails.logger.error("[sso] auto-provision failed: #{user.errors.full_messages.join('; ')}")
+        nil
+      end
+    rescue ActiveRecord::RecordNotUnique
+      # A concurrent sign-in already created the user; return that winner.
+      Rails.logger.info("[sso] provision race resolved for email=#{email}")
+      User.where('LOWER(email) = ?', email).first
+    end
+
+    def extract_name_from_claims(claims, email)
+      given  = claims['given_name'].to_s.strip.presence
+      family = claims['family_name'].to_s.strip.presence
+      return [given, family] if given || family
+
+      full = claims['name'].to_s.strip
+      if full.present?
+        parts = full.split(/\s+/, 2)
+        return [parts[0], parts[1]]
+      end
+
+      [email.split('@').first.presence, nil]
     end
 
     def safe_return_to(param)

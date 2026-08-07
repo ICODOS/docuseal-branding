@@ -38,7 +38,9 @@ Staff sign in via Microsoft Entra ID (Azure AD). The community DocuSeal image do
 
 - `GET /auth/entra` starts an OpenID Connect authorization-code flow with PKCE.
 - `GET /auth/entra/callback` verifies the returned `id_token` (RS256 signature against Entra's JWKS, `iss`, `aud`, `exp`, `nbf`, `nonce`, and the `state` CSRF value — all checks are mandatory, none can be disabled) and matches the `preferred_username` / `email` claim, case-insensitively, against an existing DocuSeal user.
-- No auto-provisioning. Unknown emails are refused with a message.
+- **Auto-provisioning on first sign-in.** If no DocuSeal user matches, one is created automatically: role `admin`, name filled from Entra's `given_name` / `family_name` / `name` claims, random password the user never sees. The Entra Enterprise Application "Assignment required = Yes" setting is the effective ACL — only users assigned to the app in Entra can reach the callback and get provisioned. **Verify that setting is on** at Azure Portal → Enterprise applications → ICODOS DocuSeal → Properties.
+- Archived DocuSeal users are not silently unarchived; they're refused with a message and require admin action.
+- Users can set their own password later via the standard "Forgot password?" flow (only reachable when `SSO_ENFORCE=false` or `SSO_BREAK_GLASS=true`).
 - Public signing routes (`/d/`, `/s/`, `/p/`) are untouched — external counterparties never see any of this.
 
 ### Environment variables (in `/opt/docuseal/.env`, not in this repo)

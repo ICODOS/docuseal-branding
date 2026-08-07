@@ -1,14 +1,12 @@
-<%# ICODOS sign-in page. Primary CTA is Microsoft SSO; the password form stays %>
-<%# available as a fallback for break-glass access. When SSO_ENFORCE=true this %>
-<%# page auto-redirects to /auth/entra before rendering (via zz_sso_entra.rb), %>
-<%# so users only see this template when password login is intentionally allowed. %>
+<%# ICODOS sign-in page. Navbar is hidden on unauth pages, so the centered %>
+<%# ICODOS logo here is the only brand on the page. Microsoft SSO is the %>
+<%# primary CTA; password form stays available as a break-glass fallback. %>
 <%= content_for(:canonical_url, new_user_session_url) %>
-<div class="max-w-lg mx-auto px-4">
+<div class="max-w-md mx-auto px-4 mt-12">
   <%= render 'devise/shared/select_server' if Docuseal.multitenant? %>
 
-  <div class="text-center mt-10 mb-8">
-    <img src="/icodos-logo.png" alt="ICODOS" style="height: 3.5rem; width: auto;" class="mx-auto">
-    <h1 class="text-3xl font-bold mt-6">Sign in to ICODOS</h1>
+  <div class="text-center mb-10">
+    <img src="/icodos-logo.png" alt="ICODOS" style="height: 4rem; width: auto;" class="mx-auto">
   </div>
 
   <a href="/auth/entra" class="base-button block text-center text-lg">
@@ -24,7 +22,7 @@
     <div class="flex-grow border-t border-gray-300"></div>
   </div>
 
-  <%= form_for(resource, as: resource_name, html: { class: 'space-y-6' }, data: { turbo: params[:redir].blank? }, url: session_path(resource_name)) do |f| %>
+  <%= form_for(resource, as: resource_name, html: { class: 'space-y-4' }, data: { turbo: params[:redir].blank? }, url: session_path(resource_name)) do |f| %>
     <%= render 'hidden_fields' %>
     <div class="space-y-2" dir="auto">
       <div class="form-control">

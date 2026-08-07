@@ -22,6 +22,7 @@ services:
       - ./branding/icodos-logo.png:/app/public/icodos-logo.png:ro
       - ./branding/shared__logo.html.erb:/app/app/views/shared/_logo.html.erb:ro
       - ./branding/shared__title.html.erb:/app/app/views/shared/_title.html.erb:ro
+      - ./branding/shared__navbar.html.erb:/app/app/views/shared/_navbar.html.erb:ro
       - ./branding/pages_landing.html.erb:/app/app/views/pages/landing.html.erb:ro
       - ./branding/devise_sessions_new.html.erb:/app/app/views/devise/sessions/new.html.erb:ro
       - ./sso/entra_auth_controller.rb:/app/app/controllers/sso/entra_auth_controller.rb:ro

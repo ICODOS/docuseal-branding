@@ -1,6 +1,8 @@
 # ICODOS DocuSeal Branding
 
-Branding overlay for our self-hosted [DocuSeal](https://github.com/docusealco/docuseal) instance at sign.icodos.com. Instead of forking and rebuilding the whole application, we mount modified view templates and the ICODOS logo over the official Docker image.
+Branding overlay for our self-hosted [DocuSeal](https://github.com/docusealco/docuseal) instance at sign.icodos.com. Instead of forking and rebuilding the whole application, we mount modified view templates and the ICODOS logo over the official Docker image, and add a Microsoft Entra SSO layer.
+
+**For everyday admin tasks — adding staff, rotating the Entra client secret, break-glass — see [`20260807-DocuSeal-Entra admin runbook-v1.md`](./20260807-DocuSeal-Entra%20admin%20runbook-v1.md).** This README documents *what's in the overlay* and *how to deploy it*; the runbook covers the recurring operations.
 
 ## What is changed
 
@@ -81,6 +83,7 @@ The SSO layer is our own code, distributed under the same public repository. Doc
 cd /opt/docuseal
 git clone https://github.com/ICODOS/docuseal-branding.git tmp-branding \
   && cp -r tmp-branding/branding . \
+  && cp -r tmp-branding/sso . \
   && cp tmp-branding/docker-compose.yml . \
   && rm -rf tmp-branding
 docker compose up -d --force-recreate app
@@ -96,9 +99,24 @@ The instance's built-in MCP server (Settings → MCP) is **enabled**, with a nam
 
 The image is version-pinned, so updates are deliberate:
 
-1. Check the [DocuSeal releases](https://github.com/docusealco/docuseal/releases) for changes to the four overridden templates: `app/views/submit_form/_docuseal_logo.html.erb`, `app/views/start_form/_docuseal_logo.html.erb`, `app/views/shared/_mailer_attribution.html.erb`, `app/views/layouts/_head_tags.html.erb`. If they changed upstream, update our copies accordingly.
+1. Check the [DocuSeal releases](https://github.com/docusealco/docuseal/releases) for changes to any of the overridden files. The current overrides map to these upstream paths:
+   - `app/views/submit_form/_docuseal_logo.html.erb`
+   - `app/views/start_form/_docuseal_logo.html.erb`
+   - `app/views/shared/_mailer_attribution.html.erb`
+   - `app/views/layouts/_head_tags.html.erb`
+   - `app/views/shared/_logo.html.erb`
+   - `app/views/shared/_title.html.erb`
+   - `app/views/shared/_navbar.html.erb`
+   - `app/views/pages/landing.html.erb`
+   - `app/views/devise/sessions/new.html.erb`
+   - `config/routes.rb` (SSO routes are added via `Rails.application.routes.append`, but if upstream removes any Devise route we mount an override for, we need to reconsider)
+   - Also check `app/controllers/application_controller.rb` and `config/initializers/devise.rb` — SSO relies on `authenticate_user!` behavior and Devise's `SessionsController` / `PasswordsController` subclass structure staying stable.
 2. Bump the version in `docker-compose.yml`, commit, deploy as above.
-3. Open sign.icodos.com and check: ICODOS header renders, a test email has no DocuSeal footer, tab title reads "ICODOS – Document Signing".
+3. Open sign.icodos.com and check:
+   - ICODOS header renders on signed-in pages, no navbar on `/sign_in` or `/`.
+   - `/auth/entra` still redirects to `login.microsoftonline.com`.
+   - A test email has no DocuSeal footer.
+   - Tab title reads "ICODOS – Document Signing".
 4. After a version bump, also confirm the MCP endpoint still responds (it is a recent DocuSeal feature).
 
 Note: the server's weekly cron (`docker compose pull`) is a no-op for the pinned app image; version bumps are manual by design. A monthly automated check compares the pinned version against the latest DocuSeal release.

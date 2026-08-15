@@ -108,6 +108,21 @@ module Mcp
       }
     }.freeze
 
+    # Stamped on every template this tool creates, so the existing Make
+    # scenario can tell "Phase E will file this one" from "nobody else will".
+    #
+    # It has to be external_id specifically: the submission.completed webhook
+    # serialises only id, name, slug, source, submitters_order, expire_at and
+    # timestamps, plus template id/name/external_id. Notably NOT preferences —
+    # so the filing folder itself is invisible to Make, and external_id is the
+    # only field available to carry a marker.
+    #
+    # Make filters on template.external_id and skips these; it keeps handling
+    # everything sent from the DocuSeal UI or the upstream tools, which carry no
+    # filing folder and which Phase E therefore ignores. Between them the two
+    # paths cover every submission exactly once.
+    PHASE_E_MARKER = 'icodos-phase-e'
+
     ALLOWED_FIELD_TYPES = %w[signature initials date text number checkbox].freeze
     MAX_FIELDS = 40
     MAX_NAME_LENGTH = 250
@@ -154,6 +169,7 @@ module Mcp
         folder: account.default_template_folder,
         source: :mcp,
         name: name,
+        external_id: PHASE_E_MARKER,
         submitters: submitters,
         fields: [],
         schema: []
@@ -194,6 +210,7 @@ module Mcp
       render_tool_result(
         id: @template.id,
         name: @template.name,
+        external_id: @template.external_id,
         folder: @template.folder&.name,
         roles: roles,
         fields: fields.length,

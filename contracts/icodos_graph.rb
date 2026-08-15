@@ -623,7 +623,8 @@ module IcodosGraph
     hint =
       case resp.status
       when 403 then ' — check the Sites.Selected per-site grant for this app (it is not visible in the Azure Portal)'
-      when 404 then ' — check ICODOS_CONTRACTS_PATH_PREFIX, including its leading folder'
+      when 404 then ' — if the file was just saved through OneDrive it may not have synced to SharePoint yet; ' \
+                    'wait a few seconds and retry. Otherwise check the path, including its leading folder'
       else ''
       end
 

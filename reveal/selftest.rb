@@ -27,7 +27,8 @@ class NilClass
   end
 end
 
-module FakeCache
+# A Redis stand-in supporting exactly the commands the guard store uses.
+module FakeRedis
   module_function
 
   def store
@@ -38,23 +39,42 @@ module FakeCache
     @store = {}
   end
 
-  def write(key, value, opts = {})
-    return false if opts[:unless_exist] && store.key?(key)
-
-    store[key] = value
-    true
+  # Set to false to simulate a Redis that does not honour NX — the condition
+  # the guard probe exists to catch.
+  def honour_nx=(value)
+    @honour_nx = value
   end
 
-  def read(key)
-    store[key]
+  def honour_nx
+    @honour_nx.nil? ? true : @honour_nx
   end
 
-  def delete(key)
-    store.delete(key)
-  end
+  def call(*args)
+    cmd = args[0].to_s.upcase
 
-  def increment(key, amount = 1)
-    store[key] = store.fetch(key, 0) + amount
+    case cmd
+    when 'SET'
+      key, value = args[1], args[2]
+      nx = args.map { |a| a.to_s.upcase }.include?('NX')
+      return nil if nx && honour_nx && store.key?(key)
+
+      store[key] = value.to_s
+      'OK'
+    when 'GETDEL' then store.delete(args[1])
+    when 'GET'    then store[args[1]]
+    when 'DEL'    then store.delete(args[1]) ? 1 : 0
+    when 'INCR'   then store[args[1]] = (store.fetch(args[1], 0).to_i + 1)
+    when 'EXPIRE' then 1
+    else raise "unexpected redis command #{cmd}"
+    end
+  end
+end
+
+module Sidekiq
+  module_function
+
+  def redis
+    yield FakeRedis
   end
 end
 
@@ -68,10 +88,6 @@ end
 
 module Rails
   module_function
-
-  def cache
-    FakeCache
-  end
 
   def logger
     FakeLogger
@@ -127,14 +143,14 @@ check('string keys survive',        IcodosReveal.intent_valid?({ 'user_id' => 7,
 
 puts "\ngrants\n\n"
 
-FakeCache.reset!
+FakeRedis.reset!
 
 jti = IcodosReveal.mint_grant!(42)
 check('minted', jti.is_a?(String) && jti.length > 20)
 check('consumed once by the right user', IcodosReveal.consume_grant!(jti, 42))
 check('second use -> rejected',          !IcodosReveal.consume_grant!(jti, 42))
 
-FakeCache.reset!
+FakeRedis.reset!
 jti2 = IcodosReveal.mint_grant!(42)
 check('wrong user -> rejected',          !IcodosReveal.consume_grant!(jti2, 43))
 check('burned even on mismatch',         !IcodosReveal.consume_grant!(jti2, 42),
@@ -144,51 +160,43 @@ check('unknown jti -> rejected',         !IcodosReveal.consume_grant!('made-up',
 check('blank jti -> rejected',           !IcodosReveal.consume_grant!('', 42))
 check('nil user -> rejected',            !IcodosReveal.consume_grant!(jti2, nil))
 
-FakeCache.reset!
+FakeRedis.reset!
 check('grants are unique', IcodosReveal.mint_grant!(1) != IcodosReveal.mint_grant!(1))
 
 # --- rate limiting -----------------------------------------------------------
 
 puts "\nrate limiting (#{IcodosReveal::RATE_LIMIT}/min)\n\n"
 
-FakeCache.reset!
+FakeRedis.reset!
 results = (1..(IcodosReveal::RATE_LIMIT + 2)).map { IcodosReveal.rate_limited?(99) }
 
 check('first attempts allowed', results.first(IcodosReveal::RATE_LIMIT).none?)
 check('over the limit blocked', results.last(2).all?)
 
-FakeCache.reset!
+FakeRedis.reset!
 check('a different user is unaffected', !IcodosReveal.rate_limited?(100))
 
-# --- single-use enforceability ----------------------------------------------
+# --- guard store ------------------------------------------------------------
+#
+# The store must PROVE it can enforce single use before the feature is offered.
+# Rails.cache on this instance is MemoryStore — per-process and lost on restart —
+# which is why grants live in Redis instead.
 
-puts "\ncache guard\n\n"
+puts "\nguard store\n\n"
 
-FakeCache.reset!
-IcodosReveal.instance_variable_set(:@single_use_enforceable, nil)
-check('honours unless_exist', IcodosReveal.single_use_enforceable?)
+FakeRedis.reset!
+FakeRedis.honour_nx = true
+IcodosReveal.instance_variable_set(:@guard_store_ready, nil)
+check('accepts a Redis that enforces NX', IcodosReveal.guard_store_ready?)
 
-module BrokenCache
-  def self.write(k, v, _o = {}); FakeCache.store[k] = v; true; end   # ignores unless_exist
-  def self.read(k); FakeCache.store[k]; end
-  def self.delete(k); FakeCache.store.delete(k); end
-end
-
-module Rails
-  def self.cache
-    @override || FakeCache
-  end
-
-  def self.override_cache(c)
-    @override = c
-  end
-end
-
-Rails.override_cache(BrokenCache)
-IcodosReveal.instance_variable_set(:@single_use_enforceable, nil)
-check('refuses a cache that ignores unless_exist', !IcodosReveal.single_use_enforceable?,
+FakeRedis.reset!
+FakeRedis.honour_nx = false
+IcodosReveal.instance_variable_set(:@guard_store_ready, nil)
+check('refuses a store that ignores NX', !IcodosReveal.guard_store_ready?,
       'a replayable grant is weaker than the password it replaces')
-Rails.override_cache(nil)
+
+FakeRedis.honour_nx = true
+IcodosReveal.instance_variable_set(:@guard_store_ready, nil)
 
 puts
 if FAILS.empty?

@@ -76,35 +76,93 @@ module IcodosReveal
       return false
     end
 
-    single_use_enforceable?
+    guard_store_ready?
   rescue StandardError => e
     warn_once(:enabled_error, "could not determine reveal availability (#{e.class}: #{e.message})")
 
     false
   end
 
-  # Same probe as Phase D's replay guard: a cache store that ignores
-  # unless_exist cannot make a grant single-use, and a replayable grant is a
-  # materially weaker control than the password it replaces.
-  def single_use_enforceable?
-    return @single_use_enforceable unless @single_use_enforceable.nil?
+  # ------------------------------------------------------------- guard store
+  #
+  # Grants and rate limits live in Redis, NOT in Rails.cache.
+  #
+  # DocuSeal hardcodes `config.cache_store = :memory_store`, which is
+  # per-process and lost on restart. A grant minted in one web process would be
+  # invisible to another, and the rate limiter would count per process — so the
+  # single-use guarantee would hold only while the app happens to run a single
+  # worker, with nothing asserting that and nothing connecting a later
+  # WEB_CONCURRENCY=2 to "reveals started failing intermittently".
+  #
+  # Redis is already present and configured for Sidekiq, so this borrows that
+  # connection rather than introducing a dependency. SET..NX..EX and GETDEL are
+  # both atomic, which makes mint and consume genuinely single-use across
+  # processes rather than nearly so.
+  #
+  # Note for whoever revisits Phase D: mcp_oauth.rb enforces single-use
+  # authorization codes and refresh tokens through Rails.cache and has the same
+  # property. Its probe checks that unless_exist is HONOURED, which MemoryStore
+  # does, but not that the store is SHARED.
+
+  def with_redis
+    raise Error, 'Sidekiq is not available' unless defined?(::Sidekiq)
+
+    ::Sidekiq.redis { |conn| yield conn }
+  end
+
+  def redis_set_nx(key, value, ttl)
+    with_redis { |c| c.call('SET', key, value.to_s, 'NX', 'EX', ttl) } == 'OK'
+  end
+
+  # Atomic read-and-delete. A plain GET then DEL would let two concurrent
+  # requests both observe the value before either removed it.
+  def redis_getdel(key)
+    with_redis { |c| c.call('GETDEL', key) }
+  end
+
+  def redis_del(key)
+    with_redis { |c| c.call('DEL', key) }
+  end
+
+  def redis_incr(key, ttl)
+    with_redis do |c|
+      count = c.call('INCR', key)
+      c.call('EXPIRE', key, ttl) if count == 1
+      count
+    end
+  end
+
+  # Proves the store can actually enforce single use before the feature is
+  # offered at all — a replayable grant is materially weaker than the password
+  # it replaces, so this fails closed rather than degrading.
+  def guard_store_ready?
+    return @guard_store_ready unless @guard_store_ready.nil?
 
     probe = "#{CACHE_PREFIX}probe:#{SecureRandom.hex(8)}"
-    first  = Rails.cache.write(probe, true, unless_exist: true, expires_in: 60)
-    second = Rails.cache.write(probe, true, unless_exist: true, expires_in: 60)
-    Rails.cache.delete(probe)
 
-    @single_use_enforceable = (first == true && second == false)
+    first  = redis_set_nx(probe, '1', 60)
+    second = redis_set_nx(probe, '1', 60)
+    redis_del(probe)
 
-    unless @single_use_enforceable
+    @guard_store_ready = (first && !second)
+
+    unless @guard_store_ready
       Rails.logger.error(
-        "[icodos-reveal] the configured cache store (#{Rails.cache.class}) does not honour " \
-        'write(unless_exist: true), so a reveal grant could not be enforced as single-use. ' \
-        'Refusing to enable SSO reveal; the password dialog stays in place.'
+        '[icodos-reveal] the Redis guard store did not enforce SET NX, so a reveal grant could not be ' \
+        'made single-use. Refusing to enable SSO reveal; the password dialog stays in place.'
       )
     end
 
-    @single_use_enforceable
+    @guard_store_ready
+  rescue StandardError => e
+    @guard_store_ready = false
+
+    Rails.logger.error(
+      "[icodos-reveal] Redis is unreachable (#{e.class}: #{e.message}), so reveal grants could not be " \
+      'stored safely. Refusing to enable SSO reveal; the password dialog stays in place.'
+    )
+
+    false
   end
 
   def grant_key(jti)
@@ -116,7 +174,7 @@ module IcodosReveal
 
     jti = SecureRandom.urlsafe_base64(32)
 
-    stored = Rails.cache.write(grant_key(jti), user_id.to_i, unless_exist: true, expires_in: GRANT_TTL)
+    stored = redis_set_nx(grant_key(jti), user_id.to_i, GRANT_TTL)
 
     raise Error, 'could not store reveal grant' unless stored
 
@@ -125,13 +183,18 @@ module IcodosReveal
 
   # Consumes unconditionally — a failed match still burns the grant, so a
   # mismatched or guessed jti cannot be retried against a different session.
+  # GETDEL does the read and the delete as one operation, so two concurrent
+  # requests cannot both observe the value.
   def consume_grant!(jti, user_id)
     return false if jti.blank? || user_id.blank?
 
-    stored = Rails.cache.read(grant_key(jti))
-    Rails.cache.delete(grant_key(jti))
+    stored = redis_getdel(grant_key(jti))
 
     stored.present? && stored.to_i == user_id.to_i
+  rescue StandardError => e
+    Rails.logger.error("[icodos-reveal] could not consume grant (#{e.class}: #{e.message})")
+
+    false
   end
 
   # auth_time is seconds since the epoch, per OIDC. Absent means the IdP did not
@@ -165,9 +228,7 @@ module IcodosReveal
   def rate_limited?(user_id)
     key = "#{RATE_PREFIX}#{user_id}:#{Time.now.to_i / 60}"
 
-    Rails.cache.write(key, 0, unless_exist: true, expires_in: 120)
-
-    Rails.cache.increment(key, 1).to_i > RATE_LIMIT
+    redis_incr(key, 120).to_i > RATE_LIMIT
   rescue StandardError => e
     # A broken counter must not become an open door.
     Rails.logger.error("[icodos-reveal] rate limiting unavailable (#{e.class}); refusing the attempt")

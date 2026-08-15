@@ -37,7 +37,7 @@ Rails.application.config.after_initialize do
   begin
     if IcodosReveal.enabled?
       Rails.logger.info(
-        "[icodos-reveal] enabled. auth_time_max_age=#{IcodosReveal::AUTH_TIME_MAX_AGE}s " \
+        "[icodos-reveal] enabled. guard=redis auth_time_max_age=#{IcodosReveal::AUTH_TIME_MAX_AGE}s " \
         "grant_ttl=#{IcodosReveal::GRANT_TTL}s rate_limit=#{IcodosReveal::RATE_LIMIT}/min"
       )
 

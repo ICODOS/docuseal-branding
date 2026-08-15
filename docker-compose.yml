@@ -72,6 +72,9 @@ services:
       # with Microsoft. They have no password to type: SSO provisioning sets a
       # random one, and SSO_ENFORCE blocks the reset flow.
       - ./reveal/icodos_reveal.rb:/app/lib/icodos_reveal.rb:ro
+      # Filename must match the constant: Zeitwerk maps lib/x.rb to X, and a
+      # mismatch stops the app booting rather than degrading.
+      - ./reveal/reveal_check.rb:/app/lib/icodos_reveal_check.rb:ro
       - ./reveal/reveal_access_token_show.html.erb:/app/app/views/reveal_access_token/show.html.erb:ro
       - ./reveal/zz_icodos_reveal.rb:/app/config/initializers/zz_icodos_reveal.rb:ro
       # --- end SSO API key reveal ---

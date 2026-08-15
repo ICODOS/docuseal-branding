@@ -387,7 +387,15 @@ The API key is a long-lived bearer credential with full account access. The prom
 
 1. **Freshness is verified, not requested.** The round trip sends `prompt=login` and `max_age=0`, then checks the returned `auth_time` claim is within 120 seconds. `prompt` is a request to the IdP; only the claim is evidence. `max_age` is what obliges Entra to return `auth_time` at all.
 2. **Identity is bound.** The re-authenticated Microsoft identity must match the DocuSeal user already signed in. Without this, anyone able to reach a signed-in session could authenticate as *themselves* and unlock the key belonging to whoever left the browser open. This is the check that matters most and the easiest to omit.
-3. **The grant is single-use and short-lived** — 120 seconds, bound to the user id, held in the cache and consumed on first read, with the jti carried in the session so it only works in the browser it was minted for.
+3. **The grant is single-use and short-lived** — 120 seconds, bound to the user id, consumed atomically on first read, with the jti carried in the session so it only works in the browser it was minted for.
+
+### Why grants live in Redis, not `Rails.cache`
+
+DocuSeal hardcodes `config.cache_store = :memory_store`, which is **per-process and lost on restart**. A grant minted in one web process would be invisible to another and the rate limiter would count per process, so the single-use guarantee would hold only while the app happens to run one worker — with nothing asserting that, and nothing later connecting `WEB_CONCURRENCY=2` to "reveals started failing intermittently".
+
+Grants and rate limits therefore use Redis, which is already present and configured for Sidekiq. `SET .. NX .. EX` and `GETDEL` are atomic, so mint and consume are genuinely single-use across processes rather than nearly so. Nothing else about how DocuSeal caches is changed.
+
+**This applies to Phase D too.** `mcp_oauth.rb` enforces single-use authorization codes and refresh tokens through `Rails.cache`, and its probe checks that `unless_exist` is *honoured* — which MemoryStore does — but not that the store is *shared*. Same shape, same silent failure mode. Left alone deliberately: it is reviewed code in the authentication path and should move under review, not as a side effect.
 
 Rate limited to 5 attempts per user per minute. A successful reveal is logged; upstream logs nothing.
 
@@ -408,6 +416,29 @@ ruby reveal/selftest.rb
 ```
 
 Covers `auth_time` boundaries (including exactly-at and one-second-stale), intent binding, grant single-use, consumption on mismatch, rate limiting, and refusal of a cache that cannot enforce single use. No Rails, no network, no tenant.
+
+### Detecting override drift on a version bump
+
+The overridden view is a copy of upstream's with three branches added. Upstream's original at tag 3.1.6 is:
+
+```
+sha256  4331da87d2a4c871b2dc76420113a7344cf1bd439c4eab234d26442b4d828c08   app/views/reveal_access_token/show.html.erb
+```
+
+On a version bump, diff the new upstream file against that baseline. If it changed, the override needs the same change — otherwise the modal renders an old layout with no error anywhere.
+
+```bash
+curl -sS https://raw.githubusercontent.com/docusealco/docuseal/refs/tags/<TAG>/app/views/reveal_access_token/show.html.erb | shasum -a 256
+```
+
+### Smoke check
+
+```bash
+docker compose exec app bin/rails runner \
+  'require "icodos_reveal_check"; IcodosRevealCheck.call'
+```
+
+Asserts the feature is enabled, SSO is configured, the guard store is Redis and actually atomic, a grant is single-use across replay and cross-user attempts, the prepend is attached, the view override is the ICODOS one, and the re-auth URL still carries `prompt=login` and `max_age=0`.
 
 ### Zeitwerk trap, learned the hard way
 

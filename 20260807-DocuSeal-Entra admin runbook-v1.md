@@ -392,3 +392,61 @@ Registration is rate limited to 20 attempts per hour per source IP. Normal use r
 - Entra App registration (secrets, redirect URIs, API permissions): Azure Portal → Microsoft Entra ID → App registrations → ICODOS DocuSeal.
 
 Last updated: 2026-08-07 (added section 7, MCP OAuth connector).
+
+---
+
+## 9. API key reveal for SSO users
+
+SSO-provisioned users have no password — provisioning sets a random one and `SSO_ENFORCE` blocks the reset flow — so DocuSeal's own "enter your password to reveal the API key" dialog is unusable for them. The overlay replaces that prompt with a fresh Microsoft re-authentication.
+
+**For the user:** Settings → API → click the key field → **Confirm with Microsoft**. Microsoft will ask them to sign in again even though they are already signed in to DocuSeal; that is deliberate and is what replaces the password. They then click the key field once more and it is revealed, for two minutes, once.
+
+### Turning it off
+
+```bash
+ssh root@31.70.107.24 'cd /opt/docuseal && sed -i "s/^ICODOS_SSO_REVEAL_ENABLED=.*/ICODOS_SSO_REVEAL_ENABLED=false/" .env && docker compose up -d'
+```
+
+Takes about fifteen seconds. DocuSeal's stock password dialog returns unchanged; nothing else is affected.
+
+### Smoke check
+
+Run after any enable, restart or DocuSeal version bump:
+
+```bash
+ssh root@31.70.107.24 'cd /opt/docuseal && docker compose exec -T -w /app app rails runner "require \"icodos_reveal_check\"; IcodosRevealCheck.call"'
+```
+
+All seven lines must read `ok`. The one that matters most is **controller patch attached** — if it detaches on a version bump, users are shown a password box they cannot fill, which looks like a user problem rather than a deployment one.
+
+### Reading the log lines
+
+| Line | Meaning |
+|---|---|
+| `[icodos-reveal] enabled. guard=redis …` | Normal, at boot |
+| `[icodos-reveal] disabled (…)` | Flag off, SSO unconfigured, or Redis unreachable. Fails closed — the password dialog is served |
+| `[icodos-reveal] API key revealed to user_id=N …` | A key was disclosed. Upstream logs nothing here; this is the audit trail |
+| `[icodos-reveal] identity mismatch …` | Someone re-authenticated as a different Microsoft account than the session they were in. Refused. **Worth asking about** |
+| `[icodos-reveal] auth_time missing or stale …` | Microsoft did not confirm a fresh sign-in. Usually a slow round trip; persistent occurrences are worth investigating |
+| `[icodos-reveal] rate limited user_id=N` | More than 5 attempts in a minute |
+| `[icodos-reveal] could not attach …` | The prepend failed, most likely after a version bump. The password dialog still works for the break-glass admin |
+
+### If Entra is down
+
+Nobody can reveal an API key while Microsoft is unreachable, including during an incident. The fallback is the console:
+
+```bash
+ssh root@31.70.107.24 'cd /opt/docuseal && docker compose exec -T -w /app app rails runner "puts User.find_by(email: %q{someone@icodos.com}).access_token.token"'
+```
+
+Treat the output as a password — it grants full API access to that account and does not expire until rotated. Rotate afterwards if it was handled carelessly.
+
+### Deployment trap
+
+The overlay's `.rb` files are bind-mounted and **Rails caches classes in production — copying a file to the server does not load it.** A `docker compose restart app` (or `up -d`) is always required.
+
+Worse, files under `lib/` must be named for the constant they define: `lib/icodos_reveal.rb` → `IcodosReveal`. A mismatch does not degrade — Zeitwerk raises, the container crash-loops, and with `SSO_ENFORCE=true` nobody can sign in. This took the instance down for 45 seconds on 15 August 2026. After any change under `lib/`, watch the first boot:
+
+```bash
+ssh root@31.70.107.24 'cd /opt/docuseal && docker compose logs app --since 60s | grep -iE "error|zeitwerk|FATAL"'
+```

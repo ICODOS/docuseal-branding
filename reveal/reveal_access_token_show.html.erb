@@ -1,0 +1,53 @@
+<%# ICODOS override of app/views/reveal_access_token/show.html.erb %>
+<%#
+  Three states:
+    1. a fresh Entra re-authentication just succeeded  -> show the key
+    2. SSO reveal is enabled                           -> offer re-authentication
+    3. otherwise                                       -> upstream password form, verbatim
+
+  State 3 is the shipped markup unchanged, so turning ICODOS_SSO_REVEAL_ENABLED
+  off restores upstream behaviour without touching this file.
+
+  CHECK THIS FILE ON EVERY DOCUSEAL VERSION BUMP — upstream restyles its views
+  freely and a stale override renders an old layout without any error.
+%>
+<%= render 'shared/turbo_modal', title: t('reveal_api_key') do %>
+  <% if @icodos_reveal_token.present? %>
+    <div class="form-control">
+      <label class="label" for="api_key"><%= t('reveal_api_key') %></label>
+      <div class="flex w-full space-x-4">
+        <%= render 'reveal_access_token/access_token', token: @icodos_reveal_token %>
+      </div>
+      <span class="label-text-alt mt-2">
+        Treat this like a password. It grants full access to this DocuSeal account and does not expire until rotated.
+      </span>
+    </div>
+  <% elsif @icodos_reveal_available %>
+    <div class="form-control">
+      <p class="text-sm">
+        Confirm it is you with Microsoft to reveal the API key. You will be asked to sign in again even though
+        you are already signed in here — that is deliberate, and it is what replaces the password prompt.
+      </p>
+      <%# data-turbo-frame _top: this is a full-page redirect out to Microsoft and
+          cannot happen inside the modal frame. %>
+      <a href="<%= sso_entra_start_path(purpose: IcodosReveal::PURPOSE) %>"
+         data-turbo-frame="_top"
+         class="base-button mt-4 w-full">
+        Confirm with Microsoft
+      </a>
+    </div>
+  <% else %>
+    <%= form_tag settings_reveal_access_token_path, enctype: 'multipart/form-data', data: { turbo_frame: :_top } do %>
+      <div class="form-control">
+        <%= label_tag :password, t('enter_your_password_to_reveal_the_api_key'), class: 'label' %>
+        <%= password_field_tag :password, nil, class: 'base-input', autocomplete: 'current-password', required: true, autofocus: true, placeholder: t('password') %>
+        <% if local_assigns[:error_message].present? %>
+          <span class="label-text-alt text-red-400 mt-1"><%= local_assigns[:error_message] %></span>
+        <% end %>
+      </div>
+      <div class="form-control mt-4">
+        <%= submit_tag t('submit'), class: 'base-button' %>
+      </div>
+    <% end %>
+  <% end %>
+<% end %>

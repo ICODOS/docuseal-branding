@@ -18,11 +18,38 @@ module Sso
     SESSION_VERIFIER_KEY = :sso_entra_code_verifier
     SESSION_RETURN_TO_KEY = :sso_entra_return_to
 
+    # Marks a round trip as an API-key re-authentication rather than a sign-in.
+    # Carried in the session, not the URL, so the registered redirect URI in
+    # Entra does not change and no app-registration edit is needed.
+    SESSION_REVEAL_KEY = :icodos_reveal_intent
+
+    # Where the grant is handed back to the reveal dialog.
+    SESSION_REVEAL_GRANT_KEY = :icodos_reveal_grant_jti
+
     def start
       unless ::Sso.configured?
         Rails.logger.warn('[sso] /auth/entra hit but SSO not configured')
         return redirect_to new_user_session_path,
                            alert: 'Microsoft sign-in is not configured on this server.'
+      end
+
+      reveal = params[:purpose].to_s == IcodosReveal::PURPOSE
+
+      if reveal
+        # Everything here fails closed and sends the user back to the settings
+        # page still signed in — this is a re-authentication, never a sign-in.
+        return redirect_to(new_user_session_path, alert: 'Please sign in first.') if current_user.nil?
+
+        unless IcodosReveal.enabled?
+          return redirect_to(settings_api_index_path,
+                             alert: 'Re-authentication to reveal the API key is not enabled on this server.')
+        end
+
+        if IcodosReveal.rate_limited?(current_user.id)
+          Rails.logger.warn("[icodos-reveal] rate limited user_id=#{current_user.id}")
+
+          return redirect_to(settings_api_index_path, alert: 'Too many attempts. Please wait a minute and try again.')
+        end
       end
 
       state         = SecureRandom.urlsafe_base64(32)
@@ -36,13 +63,19 @@ module Sso
       safe = safe_return_to(params[:return_to])
       session[SESSION_RETURN_TO_KEY] = safe if safe
 
+      session[SESSION_REVEAL_KEY] = IcodosReveal.build_intent(current_user.id) if reveal
+
       auth_uri = OidcClient.new.authorization_uri(
         state: state,
         nonce: nonce,
         code_challenge: code_challenge,
         redirect_uri: callback_url,
         scope: 'openid profile email',
-        prompt: sanitized_prompt(params[:prompt])
+        # prompt=login asks Microsoft to re-authenticate; max_age=0 obliges it
+        # to, and is what makes it return auth_time. The claim is verified in
+        # the callback — the request alone proves nothing.
+        prompt: reveal ? 'login' : sanitized_prompt(params[:prompt]),
+        max_age: reveal ? 0 : nil
       )
 
       redirect_to auth_uri, allow_other_host: true
@@ -54,6 +87,12 @@ module Sso
       code_verifier  = session.delete(SESSION_VERIFIER_KEY).to_s
       expected_nonce = session.delete(SESSION_NONCE_KEY).to_s
       return_to      = session.delete(SESSION_RETURN_TO_KEY)
+      reveal_intent  = session.delete(SESSION_REVEAL_KEY)
+
+      # Makes every early return below land the user back on the API settings
+      # page rather than the sign-in page. During a reveal they are already
+      # signed in and stay that way, so "please sign in" would be nonsense.
+      @icodos_reveal_flow = reveal_intent.present?
 
       if params[:error].present?
         Rails.logger.warn("[sso] IdP error: #{params[:error].to_s.gsub(/[[:cntrl:]]/, '')[0, 60]}")
@@ -93,6 +132,11 @@ module Sso
         return fail_login('Microsoft sign-in did not return an email address.')
       end
 
+      # API-key re-authentication branches out here, BEFORE the sign-in logic
+      # below. Critically before reset_session — this flow must leave the
+      # existing session intact, not replace it.
+      return complete_reveal!(reveal_intent, claims, email) if reveal_intent.present?
+
       user = User.where('LOWER(email) = ?', email).first
 
       if user.nil?
@@ -118,7 +162,59 @@ module Sso
     private
 
     def fail_login(message)
+      return redirect_to(settings_api_index_path, alert: message) if @icodos_reveal_flow
+
       redirect_to new_user_session_path, alert: message
+    end
+
+    # Completes an API-key re-authentication. Every path fails closed and
+    # leaves the user signed in exactly as they were.
+    #
+    # The order of checks is deliberate: session first (cheapest, and a stale
+    # intent is the common case), then freshness, then identity. The identity
+    # check is the one that matters — without it, anyone able to reach a signed-in
+    # session could authenticate as themselves at Microsoft and unlock the key
+    # belonging to whoever left the browser open.
+    def complete_reveal!(intent, claims, email)
+      user = current_user
+
+      if user.nil?
+        Rails.logger.warn('[icodos-reveal] callback with no signed-in session')
+
+        return redirect_to(new_user_session_path, alert: 'Your session expired. Sign in and try again.')
+      end
+
+      unless IcodosReveal.intent_valid?(intent, user.id)
+        Rails.logger.warn("[icodos-reveal] stale or mismatched intent for user_id=#{user.id}")
+
+        return fail_login('That request expired. Please try again.')
+      end
+
+      unless IcodosReveal.fresh_auth?(claims['auth_time'])
+        Rails.logger.warn("[icodos-reveal] auth_time missing or stale for user_id=#{user.id}")
+
+        return fail_login('Microsoft did not confirm a fresh sign-in. Please try again.')
+      end
+
+      unless ActiveSupport::SecurityUtils.secure_compare(email, user.email.to_s.strip.downcase)
+        # Deliberately does not name the account that did authenticate.
+        Rails.logger.warn("[icodos-reveal] identity mismatch: session user_id=#{user.id} re-authenticated " \
+                          'as a different Microsoft account; refusing')
+
+        return fail_login('That is a different Microsoft account. Re-authenticate as the account this ' \
+                          'DocuSeal user belongs to.')
+      end
+
+      session[SESSION_REVEAL_GRANT_KEY] = IcodosReveal.mint_grant!(user.id)
+
+      Rails.logger.info("[icodos-reveal] fresh re-authentication accepted for user_id=#{user.id}")
+
+      redirect_to settings_api_index_path,
+                  notice: 'Identity confirmed. Select the API key field to reveal it — valid for two minutes.'
+    rescue IcodosReveal::Error => e
+      Rails.logger.error("[icodos-reveal] could not issue grant: #{e.message}")
+
+      fail_login('Could not complete the check. Please try again.')
     end
 
     def callback_url
@@ -222,7 +318,7 @@ module Sso
         @client_secret = ENV.fetch('ENTRA_CLIENT_SECRET')
       end
 
-      def authorization_uri(state:, nonce:, code_challenge:, redirect_uri:, scope:, prompt: nil)
+      def authorization_uri(state:, nonce:, code_challenge:, redirect_uri:, scope:, prompt: nil, max_age: nil)
         query = {
           client_id: @client_id,
           response_type: 'code',
@@ -235,6 +331,10 @@ module Sso
           code_challenge_method: 'S256'
         }
         query[:prompt] = prompt if prompt.present?
+        # max_age=0 is meaningful and must survive a `.present?` test, hence the
+        # explicit nil check. It obliges the IdP to re-authenticate and is what
+        # makes it return the auth_time claim we verify.
+        query[:max_age] = max_age unless max_age.nil?
         "#{discovery.fetch('authorization_endpoint')}?#{query.to_query}"
       end
 

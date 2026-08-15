@@ -67,6 +67,14 @@ services:
       - ./secrets/graph_filing_key.pem:/app/config/icodos/graph_filing_key.pem:ro
       - ./secrets/graph_filing_cert.pem:/app/config/icodos/graph_filing_cert.pem:ro
       # --- end Phase E ---
+      # --- SSO API key reveal (delete this whole block to remove the code) ---
+      # Lets SSO-provisioned users reveal their API key by re-authenticating
+      # with Microsoft. They have no password to type: SSO provisioning sets a
+      # random one, and SSO_ENFORCE blocks the reset flow.
+      - ./reveal/icodos_reveal.rb:/app/lib/icodos_reveal.rb:ro
+      - ./reveal/reveal_access_token_show.html.erb:/app/app/views/reveal_access_token/show.html.erb:ro
+      - ./reveal/zz_icodos_reveal.rb:/app/config/initializers/zz_icodos_reveal.rb:ro
+      # --- end SSO API key reveal ---
     environment:
       - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/docuseal
       - FORCE_SSL=${HOST}
@@ -97,6 +105,9 @@ services:
       # to. Defaults to icodos.com,icodos.de when unset — see the constant in
       # send_contract_controller.rb for why this guard exists.
       - ICODOS_CONTRACTS_FIRST_SIGNER_DOMAINS=${ICODOS_CONTRACTS_FIRST_SIGNER_DOMAINS:-}
+      # SSO API key reveal. Off unless explicitly true; when off the upstream
+      # password dialog is served unchanged.
+      - ICODOS_SSO_REVEAL_ENABLED=${ICODOS_SSO_REVEAL_ENABLED:-false}
 
   postgres:
     image: postgres:16

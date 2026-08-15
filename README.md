@@ -371,6 +371,54 @@ The prepends fail closed and log `[icodos-contracts] could not attach to the MCP
 
 These files are part of the modified source published for AGPL-3.0 compliance. DocuSeal attribution in the interactive UI is untouched.
 
+## Revealing the API key without a password
+
+Upstream gates the API key behind `current_user.valid_password?`. SSO-provisioned users are created with `password: SecureRandom.hex(16)` — a value nobody ever sees — so that check can never succeed for them, and `SSO_ENFORCE` blocks the "Forgot password?" flow that would otherwise let them set one. On an SSO-only instance the key is unreachable for everyone but the break-glass admin.
+
+This replaces the password proof with a fresh Microsoft re-authentication.
+
+### What the password prompt was for
+
+Worth stating, because a replacement that merely checks "is this request signed in" would look equivalent and be a straight downgrade.
+
+The API key is a long-lived bearer credential with full account access. The prompt exists so that a live session is **not** sufficient to walk away with it — someone holding a stolen cookie, or sitting at an unlocked laptop, has to prove identity again. The requirement is *fresh proof of identity at the moment of reveal*.
+
+### How the replacement holds that property
+
+1. **Freshness is verified, not requested.** The round trip sends `prompt=login` and `max_age=0`, then checks the returned `auth_time` claim is within 120 seconds. `prompt` is a request to the IdP; only the claim is evidence. `max_age` is what obliges Entra to return `auth_time` at all.
+2. **Identity is bound.** The re-authenticated Microsoft identity must match the DocuSeal user already signed in. Without this, anyone able to reach a signed-in session could authenticate as *themselves* and unlock the key belonging to whoever left the browser open. This is the check that matters most and the easiest to omit.
+3. **The grant is single-use and short-lived** — 120 seconds, bound to the user id, held in the cache and consumed on first read, with the jti carried in the session so it only works in the browser it was minted for.
+
+Rate limited to 5 attempts per user per minute. A successful reveal is logged; upstream logs nothing.
+
+### It fails closed, everywhere
+
+Not enabled, SSO unconfigured, a cache that ignores `unless_exist`, a missing or stale `auth_time`, an identity mismatch, an expired intent, a broken rate-limiter — every one of these serves the upstream password dialog or refuses, and none of them reveals anything. `ICODOS_SSO_REVEAL_ENABLED` unset restores stock behaviour exactly.
+
+The re-authentication branch returns **before** `reset_session` in the SSO callback: this is a re-auth, not a sign-in, and it must leave the existing session intact.
+
+| Variable | |
+|---|---|
+| `ICODOS_SSO_REVEAL_ENABLED` | `false` unless explicitly `true` |
+
+### Offline test
+
+```bash
+ruby reveal/selftest.rb
+```
+
+Covers `auth_time` boundaries (including exactly-at and one-second-stale), intent binding, grant single-use, consumption on mismatch, rate limiting, and refusal of a cache that cannot enforce single use. No Rails, no network, no tenant.
+
+### Zeitwerk trap, learned the hard way
+
+`lib/foo.rb` must define the constant `Foo`. A second file `lib/icodos_reveal_patch.rb` defining `IcodosReveal::RevealAccessTokenPatch` **stops the application booting** — Zeitwerk raises, the container crash-loops, and with `SSO_ENFORCE=true` nobody can sign in. It does not degrade gracefully. The patch module therefore lives inside `lib/icodos_reveal.rb` alongside its parent namespace.
+
+If you add files to `lib/`, name them for the constant they define, and watch the first boot.
+
+### AGPL note
+
+Part of the modified source published for AGPL-3.0 compliance. DocuSeal attribution in the interactive UI is untouched.
+
 ## Updating DocuSeal itself
 
 The image is version-pinned, so updates are deliberate:

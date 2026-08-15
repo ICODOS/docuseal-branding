@@ -46,6 +46,27 @@ services:
       #   chmod 400 secrets/mcp_oauth_signing_key.pem
       - ./secrets/mcp_oauth_signing_key.pem:/app/config/icodos/mcp_oauth_signing_key.pem:ro
       # --- end Phase D ---
+      # --- Phase E: SharePoint contract filing (delete this whole block to remove the code) ---
+      - ./contracts/icodos_graph.rb:/app/lib/icodos_graph.rb:ro
+      - ./contracts/graph_check.rb:/app/lib/icodos_graph_check.rb:ro
+      - ./contracts/create_contract_template_controller.rb:/app/app/controllers/mcp/icodos_create_contract_template_controller.rb:ro
+      - ./contracts/send_contract_controller.rb:/app/app/controllers/mcp/icodos_send_contract_controller.rb:ro
+      - ./contracts/filing_hook_controller.rb:/app/app/controllers/icodos/filing_hook_controller.rb:ro
+      - ./contracts/zz_icodos_contracts.rb:/app/config/initializers/zz_icodos_contracts.rb:ro
+      # BOTH halves of the certificate are needed. The private key signs the
+      # client assertion; the certificate supplies the SHA-1 thumbprint Entra
+      # uses to identify which uploaded credential signed it (the x5t header).
+      # Mounting only the key produces AADSTS700027 at runtime.
+      #   openssl req -x509 -newkey rsa:3072 -sha256 -days 730 -nodes \
+      #     -keyout secrets/graph_filing_key.pem \
+      #     -out    secrets/graph_filing_cert.pem \
+      #     -subj "/CN=ICODOS DocuSeal Filing"
+      #   chown 2000:2000 secrets/graph_filing_key.pem secrets/graph_filing_cert.pem
+      #   chmod 400 secrets/graph_filing_key.pem
+      #   chmod 444 secrets/graph_filing_cert.pem   # public half, but keep it readable by uid 2000
+      - ./secrets/graph_filing_key.pem:/app/config/icodos/graph_filing_key.pem:ro
+      - ./secrets/graph_filing_cert.pem:/app/config/icodos/graph_filing_cert.pem:ro
+      # --- end Phase E ---
     environment:
       - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/docuseal
       - FORCE_SSL=${HOST}
@@ -63,6 +84,19 @@ services:
       - MCP_OAUTH_ALLOWED_REDIRECT_HOSTS=${MCP_OAUTH_ALLOWED_REDIRECT_HOSTS:-}
       - MCP_OAUTH_ACCESS_TOKEN_TTL=${MCP_OAUTH_ACCESS_TOKEN_TTL:-}
       - MCP_OAUTH_REFRESH_TOKEN_TTL=${MCP_OAUTH_REFRESH_TOKEN_TTL:-}
+      # Phase E — SharePoint contract filing. Off unless ICODOS_CONTRACTS_ENABLED=true.
+      - ICODOS_CONTRACTS_ENABLED=${ICODOS_CONTRACTS_ENABLED:-false}
+      - ICODOS_GRAPH_TENANT_ID=${ICODOS_GRAPH_TENANT_ID:-}
+      - ICODOS_GRAPH_CLIENT_ID=${ICODOS_GRAPH_CLIENT_ID:-}
+      - ICODOS_GRAPH_KEY_PATH=${ICODOS_GRAPH_KEY_PATH:-/app/config/icodos/graph_filing_key.pem}
+      - ICODOS_GRAPH_CERT_PATH=${ICODOS_GRAPH_CERT_PATH:-/app/config/icodos/graph_filing_cert.pem}
+      - ICODOS_GRAPH_SITE_HOSTNAME=${ICODOS_GRAPH_SITE_HOSTNAME:-}
+      - ICODOS_GRAPH_SITE_PATH=${ICODOS_GRAPH_SITE_PATH:-}
+      - ICODOS_CONTRACTS_PATH_PREFIX=${ICODOS_CONTRACTS_PATH_PREFIX:-}
+      # Domains the FIRST signer (the countersigning ICODOS entity) must belong
+      # to. Defaults to icodos.com,icodos.de when unset — see the constant in
+      # send_contract_controller.rb for why this guard exists.
+      - ICODOS_CONTRACTS_FIRST_SIGNER_DOMAINS=${ICODOS_CONTRACTS_FIRST_SIGNER_DOMAINS:-}
 
   postgres:
     image: postgres:16

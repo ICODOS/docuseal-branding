@@ -248,6 +248,129 @@ Both reviewers independently flagged the absence of per-grant revocation; see "K
 
 Like the SSO layer, this is our own code distributed under the same public repository. DocuSeal attribution in the DocuSeal UI is unchanged.
 
+## Phase E — contract tools: SharePoint in, signed PDF out
+
+Two MCP tools and one internal webhook that move ICODOS employment-contract preparation off the browser entirely. An agent produces the document, files it in SharePoint as before, then makes two tool calls. DocuSeal reads the file server-side, places the signature fields, sends employer-first, and files the signed PDF back when both parties have signed.
+
+Same overlay pattern as Phase D: bind-mounted files, no image rebuild, no new gems, no database migrations.
+
+### The tools
+
+| Tool | What it does |
+|---|---|
+| `icodos_create_contract_template` | Reads a PDF from the SharePoint contracts folder, creates a template with fields placed, roles assigned, folder set, and the filing destination recorded |
+| `icodos_send_contract` | Sends for signature with `submitters_order: 'preserved'`. Returns a **preview** and sends nothing unless `confirm` is true |
+
+Both inherit `Mcp::McpBaseController`, so authentication, the archived-user check and the Phase D OAuth hook apply exactly as they do to the five upstream tools. Archiving a DocuSeal user still revokes access.
+
+### Why not the upstream tools
+
+`create_template` accepts only a name and an optional URL, hardcodes the folder to the account default and the fields to `[]`, and its URL branch needs the contract exposed at a fetchable address. `send_documents` has no signing-order parameter and falls back to `'random'` when the template preference is unset — which is the case for every template created before Phase E. Employer-first is a hard requirement for employment documents, so it is hardcoded here.
+
+### Reading file content is not a Graph operation
+
+The one genuinely surprising thing in this layer, and the reason two Entra permissions are needed rather than one.
+
+Graph serves metadata, listings, uploads and deletes with a Graph-audience token. It does **not** serve file content: `GET .../content` returns `302` to `_layouts/15/download.aspx`, and `@microsoft.graph.downloadUrl` points at the same place. In this tenant that endpoint returns `401` with an HTML sign-in page for every credential — no token, a Graph token, and a valid SharePoint token alike. The embedded `tempauth` parameter is not honoured.
+
+What works is SharePoint's own REST API with a SharePoint-audience token:
+
+```
+GET https://<tenant>.sharepoint.com/sites/<site>/_api/web/GetFileByServerRelativeUrl('<server-relative>')/$value
+Authorization: Bearer <token for https://<tenant>.sharepoint.com>
+```
+
+So the app registration holds `Sites.Selected` on **both** Microsoft Graph and Office 365 SharePoint Online (different resources, different role GUIDs), and the client caches a token per audience. A single per-site grant covers both.
+
+### The path allowlist is the security boundary
+
+`Sites.Selected` scopes to a site, not a folder, and the ICODOS contracts library lives on the org-wide site. The only thing confining these tools to the employee-contracts tree is `IcodosGraph#normalize_path!`.
+
+That matters because the paths arrive as MCP tool arguments — model-generated text derived from Notion pages, email and documents the company does not fully control. The allowlist normalises first and then requires a **segment-wise** prefix match, so `.../01 Employee contracts evil/x.pdf` is rejected rather than accepted by a string comparison. Colons are rejected outright because Graph addresses drive items as `/root:/{path}:/content` and a colon would silently retarget the request.
+
+`contracts/selftest.rb` covers this offline, with no network, credentials or Rails:
+
+```bash
+ruby contracts/selftest.rb
+```
+
+### Other deliberate constraints
+
+- **Sending is a separate tool from preparing**, so a contract can never be sent as a side effect of building one, and `confirm` must be true or the tool only previews.
+- **The first signer must be at a configured domain** (`ICODOS_CONTRACTS_FIRST_SIGNER_DOMAINS`, default `icodos.com,icodos.de`). The first signer countersigns for ICODOS; without this, an instruction smuggled into a document could send a fabricated contract with both roles pointed at addresses an attacker controls.
+- **Filing never overwrites.** A name collision files alongside with a numeric suffix and logs a warning, because silently replacing an executed employment contract is not an acceptable failure mode.
+- **Filing is idempotent.** The filed path is recorded on the submission; DocuSeal retries any non-2xx up to ten times, and a transient failure after a successful upload must not duplicate a contract.
+- **Submissions without a recorded filing folder are ignored**, so anything sent outside these tools is left to whatever automation already handles it.
+
+### The filing webhook
+
+`POST /icodos/hooks/filing`, registered as a DocuSeal webhook pointing at `http://app:3000/icodos/hooks/filing` — inside the compose network, never publicly exposed. `SendWebhookRequest` only enforces HTTPS and blocks localhost when `Docuseal.multitenant?`, which is false here, so an internal address is accepted.
+
+It is still authenticated: DocuSeal HMAC-signs every webhook and the signature is verified with `WebhookUrls::Signatures.verify`. Note that `WebhookUrl#url` is encrypted non-deterministically, so the registration cannot be found with a SQL `LIKE` — the lookup filters in Ruby after decryption.
+
+Register it once:
+
+```ruby
+WebhookUrl.create!(account: <account>, url: 'http://app:3000/icodos/hooks/filing',
+                   events: ['submission.completed'])
+```
+
+Deliveries are recorded as `WebhookEvent`s and visible in the DocuSeal UI, so failures surface where someone already looks.
+
+### Environment variables (in `/opt/docuseal/.env`, not in this repo)
+
+| Variable | Notes |
+|---|---|
+| `ICODOS_CONTRACTS_ENABLED` | `false` unless explicitly `true`. Off means the tools are neither advertised nor routable |
+| `ICODOS_GRAPH_TENANT_ID` | Entra tenant |
+| `ICODOS_GRAPH_CLIENT_ID` | The "ICODOS DocuSeal Filing" app registration — deliberately **not** the SSO app |
+| `ICODOS_GRAPH_KEY_PATH` | Private key. Both halves are needed: the key signs the client assertion, the certificate supplies the `x5t` thumbprint |
+| `ICODOS_GRAPH_CERT_PATH` | Certificate |
+| `ICODOS_GRAPH_SITE_HOSTNAME` | e.g. `<tenant>.sharepoint.com` |
+| `ICODOS_GRAPH_SITE_PATH` | e.g. `/sites/<site>` |
+| `ICODOS_CONTRACTS_PATH_PREFIX` | The only subtree these tools may touch |
+| `ICODOS_CONTRACTS_FIRST_SIGNER_DOMAINS` | Optional; defaults to `icodos.com,icodos.de` |
+
+### The credential
+
+A separate app registration from SSO, holding a **certificate rather than a client secret**. Adding an application permission to the SSO app would have turned its secret from one factor in a user sign-in flow into a standalone key to every employment contract, and the secret-rotation procedure copies `.env` to backup files on the host. The certificate stays in one `0400` file owned by uid 2000, the same shape as the Phase D signing key.
+
+```bash
+mkdir -p secrets && chmod 700 secrets
+openssl req -x509 -newkey rsa:3072 -sha256 -days 730 -nodes \
+  -keyout secrets/graph_filing_key.pem \
+  -out    secrets/graph_filing_cert.pem \
+  -subj "/CN=ICODOS DocuSeal Filing"
+chown 2000:2000 secrets/graph_filing_key.pem secrets/graph_filing_cert.pem
+chmod 400 secrets/graph_filing_key.pem
+chmod 444 secrets/graph_filing_cert.pem
+```
+
+Upload the **certificate** (public half) to the app registration. Add its expiry to the quarterly checks — a lapsed certificate stops contract filing quietly, unlike a lapsed SSO secret which everyone notices at once.
+
+### Smoke check
+
+Run after any enable, key rotation, or DocuSeal version bump. `write: true` additionally round-trips a probe file and deletes it.
+
+```bash
+docker compose exec app bin/rails runner \
+  'require "icodos_graph_check"; IcodosGraphCheck.call(write: true)'
+```
+
+It verifies the configuration, both tokens, the SharePoint roles claim, site and drive resolution, the path allowlist, tool registration, the filing route and webhook, and the first-signer guard. `Sites.Selected` in particular shows a green tick in the Azure Portal while granting access to nothing, so the only honest test is reading a real file.
+
+### What breaks on a version bump
+
+Phase E depends on these internal APIs, none of which are a public contract:
+
+`Templates::CreateAttachments` · `Submissions.create_from_submitters` · `Submissions::EnsureCombinedGenerated` · `WebhookUrls::Signatures` · `McpController#call` · `Mcp::ProtocolController#tools_list`
+
+The prepends fail closed and log `[icodos-contracts] could not attach to the MCP controllers`; the boot line reports whether the dispatch hook attached. From an MCP client, unregistered tools are indistinguishable from tools that never existed, which is why the smoke check asserts registration explicitly.
+
+### AGPL note
+
+These files are part of the modified source published for AGPL-3.0 compliance. DocuSeal attribution in the interactive UI is untouched.
+
 ## Updating DocuSeal itself
 
 The image is version-pinned, so updates are deliberate:

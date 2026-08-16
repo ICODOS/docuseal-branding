@@ -11,7 +11,11 @@
 #   ruby contracts/selftest.rb
 
 P = 'General/09 Legal Documents/10 Contracts/01 Employee contracts'
-ENV['ICODOS_CONTRACTS_PATH_PREFIX'] = P
+Q = 'General/03 Public Financing/05 Reporting for public funded projects/03 Signed Off Time Reporting Sheets'
+
+# "|" not "," — six folders in this library have commas in their names, so a
+# comma-separated list would split a legitimate prefix into fragments.
+ENV['ICODOS_CONTRACTS_PATH_PREFIX'] = "#{P}|#{Q}"
 
 # Deliberately fake — get_json is stubbed below, so these only have to be
 # present for URL construction. No real tenant is contacted by this file.
@@ -42,7 +46,9 @@ MUST_REJECT = [
   ['wildcard',                "#{P}/*.pdf"],
   ['control char',            "#{P}/a\nb.pdf"],
   ['dot segment',             "#{P}/./x.pdf"],
-  ['different top folder',    'Shared/09 Legal Documents/10 Contracts/01 Employee contracts/x.pdf']
+  ['different top folder',    'Shared/09 Legal Documents/10 Contracts/01 Employee contracts/x.pdf'],
+  ['sibling of second tree',  'General/03 Public Financing/05 Reporting for public funded projects/x.pdf'],
+  ['second tree, bypass',     "#{Q} evil/x.pdf"]
 ].freeze
 
 MUST_ACCEPT = [
@@ -51,7 +57,10 @@ MUST_ACCEPT = [
   ['working draft',           "#{P}/Archive/Working versions of employee contracts/f.pdf"],
   ['umlaut + spaces',         "#{P}/Signed Contracts/000031 Jörg Müller/Änderung.pdf"],
   ['leading slash tolerated', "/#{P}/x.pdf"],
-  ['duplicated separators',   "#{P}//Signed Contracts///x.pdf"]
+  ['duplicated separators',   "#{P}//Signed Contracts///x.pdf"],
+  ['second tree itself',      Q],
+  ['inside the second tree',  "#{Q}/2026-08 Timesheet Devraj Solanki.pdf"],
+  ['umlaut in second tree',   "#{Q}/2026-08 Zeiterfassung Jörg Müller.pdf"]
 ].freeze
 
 puts "\npath allowlist — must reject\n\n"
@@ -70,7 +79,7 @@ puts "\npath allowlist — must accept\n\n"
 MUST_ACCEPT.each do |label, input|
   begin
     got = IcodosGraph.normalize_path!(input)
-    check(label, got.start_with?(P), got)
+    check(label, got.start_with?(P) || got.start_with?(Q), got)
   rescue StandardError => e
     check(label, false, "rejected a valid path (#{e.message})")
   end

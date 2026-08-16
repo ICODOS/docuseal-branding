@@ -81,10 +81,14 @@ module IcodosGraphCheck
       IcodosGraph.drive_id
     end
 
-    step('contracts folder is readable') do
-      entries = IcodosGraph.list(IcodosGraph.path_prefix)
-      folders = entries.count { |e| e['folder'] }
-      "#{entries.length} entries (#{folders} folders) under #{IcodosGraph.path_prefix}"
+    # Every configured tree, not just the first — a prefix added to .env but
+    # misspelled would otherwise sit there looking fine until someone used it.
+    step('permitted folders are readable') do
+      IcodosGraph.path_prefixes.map do |prefix|
+        entries = IcodosGraph.list(prefix)
+
+        "#{prefix.split('/').last} (#{entries.length})"
+      end.join(', ')
     end
 
     # The path allowlist is the security boundary, so prove it rejects rather

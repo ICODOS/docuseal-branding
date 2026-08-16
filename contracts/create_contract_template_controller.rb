@@ -157,9 +157,20 @@ module Mcp
 
       submitters = roles.map { |role| { 'name' => role, 'uuid' => SecureRandom.uuid } }
 
-      bytes = IcodosGraph.download(source_path)
+      # Waits out OneDrive sync rather than failing on a 404 the caller would
+      # have to interpret. See IcodosGraph#download_when_synced.
+      bytes = IcodosGraph.download_when_synced(source_path)
 
       raise InvalidArguments, "#{source_path} is empty" if bytes.empty?
+
+      # Cheap insurance against a .docx passed by mistake, or a file OneDrive
+      # has only partly written. Without it the template is created from
+      # whatever arrived and the problem surfaces at signature time.
+      unless bytes[0, 5].to_s.b == '%PDF-'.b
+        raise InvalidArguments,
+              "#{source_path} does not look like a PDF (it begins #{bytes[0, 8].to_s.inspect}). " \
+              'Pass the PDF, not the .docx, and make sure OneDrive has finished writing it.'
+      end
 
       account = current_user.account
 

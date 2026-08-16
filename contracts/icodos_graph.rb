@@ -195,11 +195,28 @@ module IcodosGraph
     '/' + ENV.fetch('ICODOS_GRAPH_SITE_PATH').strip.delete_prefix('/').delete_suffix('/')
   end
 
-  # The one folder subtree this client may touch. Normalised the same way as
-  # every path it validates, so a trailing slash or duplicated separator in the
-  # .env cannot open a gap between prefix and check.
+  # The folder subtrees this client may touch. Each is normalised the same way
+  # as every path it validates, so a trailing slash or duplicated separator in
+  # the .env cannot open a gap between prefix and check.
+  #
+  # SEPARATOR IS "|", NOT ",". Six folders in this library have commas in their
+  # names — "06 Design, Branding, Marketing, Conferences", "09 Internet, mobile,
+  # celular" and others — so a comma-separated list would silently split a
+  # legitimate prefix into bogus fragments the first time one was used. "|" is
+  # already in FORBIDDEN_PATH_CHARS, so it can never appear in a valid path and
+  # is unambiguous by construction.
+  def path_prefixes
+    @path_prefixes ||= ENV.fetch('ICODOS_CONTRACTS_PATH_PREFIX')
+                          .split('|')
+                          .map { |raw| collapse(raw) }
+                          .reject(&:empty?)
+                          .uniq
+  end
+
+  # The primary tree — used for boot logging and as the smoke check's probe
+  # location. Validation always considers every prefix, not just this one.
   def path_prefix
-    @path_prefix ||= collapse(ENV.fetch('ICODOS_CONTRACTS_PATH_PREFIX'))
+    path_prefixes.first
   end
 
   # ----------------------------------------------------------------------- keys
@@ -364,11 +381,15 @@ module IcodosGraph
 
     # Prefix match on SEGMENTS, not on the string. A string comparison would
     # accept ".../01 Employee contracts evil/x.pdf" as being inside
-    # ".../01 Employee contracts".
-    prefix_segments = path_prefix.split('/')
+    # ".../01 Employee contracts". Any one of the configured trees may match.
+    permitted = path_prefixes.any? do |prefix|
+      prefix_segments = prefix.split('/')
 
-    unless segments.first(prefix_segments.length) == prefix_segments
-      raise PathError, 'path is outside the permitted contracts folder'
+      segments.first(prefix_segments.length) == prefix_segments
+    end
+
+    unless permitted
+      raise PathError, "path is outside the permitted folders (#{path_prefixes.join(' | ')})"
     end
 
     path
@@ -452,6 +473,46 @@ module IcodosGraph
   end
 
   # -------------------------------------------------------------------- files
+
+  # How long to keep retrying a 404 on a source document before giving up.
+  # Cowork writes generated PDFs through the OneDrive-synced library on the
+  # Mac, so there is a real gap between "saved" and "visible to SharePoint".
+  SYNC_WAIT_SECONDS = 30
+  SYNC_POLL_SECONDS = 3
+
+  # download, but tolerant of a file that has been saved locally and not yet
+  # synced up. ONLY 404 is retried — a 403 means access, not timing, and
+  # retrying it would delay the real diagnosis by half a minute.
+  #
+  # Without this the caller sees a 404, has to reason about whether the path is
+  # wrong or the sync is slow, and decides for itself whether to wait. That is
+  # a judgement call in the middle of a routine, which is exactly what should
+  # not be left to inference.
+  def download_when_synced(raw_path, timeout: SYNC_WAIT_SECONDS)
+    deadline = Time.now.to_i + timeout
+    attempts = 0
+
+    begin
+      attempts += 1
+
+      download(raw_path)
+    rescue GraphError => e
+      raise unless e.status == 404
+
+      if Time.now.to_i < deadline
+        sleep SYNC_POLL_SECONDS
+
+        retry
+      end
+
+      raise GraphError.new(
+        "#{raw_path} was still not visible in SharePoint after #{timeout}s (#{attempts} attempts). " \
+        'If it was just saved through OneDrive, check that OneDrive is running and has finished ' \
+        'uploading. Otherwise the path is wrong.',
+        status: 404
+      )
+    end
+  end
 
   # Returns the raw bytes of a file. Path is validated before use.
   def download(raw_path)

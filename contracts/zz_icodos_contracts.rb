@@ -134,7 +134,7 @@ Rails.application.config.after_initialize do
     if IcodosContracts.enabled?
       Rails.logger.info(
         "[icodos-contracts] enabled. site=#{IcodosGraph.site_hostname}#{IcodosGraph.site_path} " \
-        "prefix=#{IcodosGraph.path_prefix.inspect} " \
+        "prefixes=#{IcodosGraph.path_prefixes.inspect} " \
         "tools=#{IcodosContracts::TOOL_CONTROLLER_NAMES.keys.join(',')} " \
         "cert_expires=#{IcodosGraph.certificate.not_after.utc.iso8601}"
       )

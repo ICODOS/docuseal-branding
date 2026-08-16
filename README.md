@@ -288,6 +288,20 @@ So the app registration holds `Sites.Selected` on **both** Microsoft Graph and O
 
 That matters because the paths arrive as MCP tool arguments — model-generated text derived from Notion pages, email and documents the company does not fully control. The allowlist normalises first and then requires a **segment-wise** prefix match, so `.../01 Employee contracts evil/x.pdf` is rejected rather than accepted by a string comparison. Colons are rejected outright because Graph addresses drive items as `/root:/{path}:/content` and a colon would silently retarget the request.
 
+### More than one permitted tree
+
+`ICODOS_CONTRACTS_PATH_PREFIX` accepts several trees, **separated by `|`**. Employment contracts and EU time-report sign-offs live in different parts of the library, and the alternative — widening the prefix to a common ancestor — would have exposed customer contracts, banking documents, insurance policies and lawyer correspondence to these tools.
+
+The separator is `|` and not `,` because six folders in this library have commas in their names (`06 Design, Branding, Marketing, Conferences`, `09 Internet, mobile, celular`, and others). A comma-separated list would have silently split a legitimate prefix into fragments the first time one of them was used. `|` is already in `FORBIDDEN_PATH_CHARS`, so it can never appear in a valid path and is unambiguous by construction.
+
+Each tree is matched segment-wise independently, so adding one does not weaken the others.
+
+### Waiting out OneDrive
+
+Documents are often written through the OneDrive-synced library on a Mac, so there is a real gap between "saved" and "visible to SharePoint". `download_when_synced` retries **only** a 404, for 30 seconds, then fails with a message naming OneDrive rather than the path. A 403 fails immediately — that is access, not timing, and retrying would delay the real diagnosis.
+
+The create tool also checks the file actually starts with `%PDF-`, so a `.docx` passed by mistake, or a half-written file, fails at creation rather than at signature time.
+
 `contracts/selftest.rb` covers this offline, with no network, credentials or Rails:
 
 ```bash

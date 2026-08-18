@@ -198,6 +198,35 @@ check('refuses a store that ignores NX', !IcodosReveal.guard_store_ready?,
 FakeRedis.honour_nx = true
 IcodosReveal.instance_variable_set(:@guard_store_ready, nil)
 
+# REGRESSION: a transient Redis failure must NOT be cached. Redis starts inside
+# the app container and is often not listening when Rails finishes booting; an
+# earlier version memoised the failure and disabled the feature for the whole
+# life of that web process while a fresh console reported it working.
+module BrokenRedis
+  def self.call(*_args)
+    raise 'connection refused'
+  end
+end
+
+module Sidekiq
+  def self.redis
+    yield(@override || FakeRedis)
+  end
+
+  def self.override_redis(r)
+    @override = r
+  end
+end
+
+IcodosReveal.instance_variable_set(:@guard_store_ready, nil)
+Sidekiq.override_redis(BrokenRedis)
+check('unreachable Redis -> not ready', !IcodosReveal.guard_store_ready?)
+
+Sidekiq.override_redis(nil)
+FakeRedis.reset!
+check('recovers once Redis returns', IcodosReveal.guard_store_ready?,
+      'a transient boot-time failure must not disable the feature until restart')
+
 puts
 if FAILS.empty?
   puts 'reveal selftest: all checks passed'

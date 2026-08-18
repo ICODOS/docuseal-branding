@@ -135,8 +135,20 @@ module IcodosReveal
   # Proves the store can actually enforce single use before the feature is
   # offered at all — a replayable grant is materially weaker than the password
   # it replaces, so this fails closed rather than degrading.
+  # ONLY SUCCESS IS MEMOISED, and that distinction is load-bearing.
+  #
+  # Redis runs inside the app container and is frequently not yet accepting
+  # connections when Rails finishes booting. An earlier version cached the
+  # failure, so the boot-time diagnostic probed too early, got "connection
+  # refused", and disabled the reveal for the whole life of that web process —
+  # a feature that reported itself working in a fresh console while being off
+  # in the running server. Exactly the class of silent failure this overlay
+  # exists to avoid.
+  #
+  # Caching only the positive costs one Redis round trip per request until the
+  # first success, and then nothing.
   def guard_store_ready?
-    return @guard_store_ready unless @guard_store_ready.nil?
+    return true if @guard_store_ready
 
     probe = "#{CACHE_PREFIX}probe:#{SecureRandom.hex(8)}"
 
@@ -144,23 +156,22 @@ module IcodosReveal
     second = redis_set_nx(probe, '1', 60)
     redis_del(probe)
 
-    @guard_store_ready = (first && !second)
+    ready = (first && !second)
 
-    unless @guard_store_ready
-      Rails.logger.error(
-        '[icodos-reveal] the Redis guard store did not enforce SET NX, so a reveal grant could not be ' \
-        'made single-use. Refusing to enable SSO reveal; the password dialog stays in place.'
-      )
+    if ready
+      @guard_store_ready = true
+    else
+      warn_once(:nx_ignored,
+                'the Redis guard store did not enforce SET NX, so a reveal grant could not be made ' \
+                'single-use. Refusing to enable SSO reveal; the password dialog stays in place.')
     end
 
-    @guard_store_ready
+    ready
   rescue StandardError => e
-    @guard_store_ready = false
-
-    Rails.logger.error(
-      "[icodos-reveal] Redis is unreachable (#{e.class}: #{e.message}), so reveal grants could not be " \
-      'stored safely. Refusing to enable SSO reveal; the password dialog stays in place.'
-    )
+    # Deliberately NOT memoised — see above.
+    warn_once(:redis_unreachable,
+              "Redis is not reachable yet (#{e.class}). SSO reveal stays off until it is; this is " \
+              'expected briefly at boot and will re-check on the next request.')
 
     false
   end

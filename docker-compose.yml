@@ -78,6 +78,17 @@ services:
       - ./reveal/reveal_access_token_show.html.erb:/app/app/views/reveal_access_token/show.html.erb:ro
       - ./reveal/zz_icodos_reveal.rb:/app/config/initializers/zz_icodos_reveal.rb:ro
       # --- end SSO API key reveal ---
+      # --- Reminders (delete this whole block to remove the code) ---
+      # Automatic signature reminders, which DocuSeal ships only in Pro. Our
+      # build has the reminder email template and audit event type but nothing
+      # that schedules or sends. Filenames match their constants — Zeitwerk maps
+      # lib/x.rb to X, and a mismatch stops the app booting.
+      - ./reminders/icodos_reminders.rb:/app/lib/icodos_reminders.rb:ro
+      - ./reminders/reminder_sweep.rb:/app/lib/icodos_reminder_sweep.rb:ro
+      - ./reminders/reminder_check.rb:/app/lib/icodos_reminder_check.rb:ro
+      - ./reminders/selftest.rb:/app/lib/icodos_reminders_selftest.rb:ro
+      - ./reminders/zz_icodos_reminders.rb:/app/config/initializers/zz_icodos_reminders.rb:ro
+      # --- end Reminders ---
     environment:
       - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/docuseal
       - FORCE_SSL=${HOST}
@@ -111,6 +122,10 @@ services:
       # SSO API key reveal. Off unless explicitly true; when off the upstream
       # password dialog is served unchanged.
       - ICODOS_SSO_REVEAL_ENABLED=${ICODOS_SSO_REVEAL_ENABLED:-false}
+      # Reminders. DRY_RUN defaults to true: sending requires setting it to
+      # false explicitly, so a half-finished deployment cannot start emailing.
+      - ICODOS_REMINDERS_ENABLED=${ICODOS_REMINDERS_ENABLED:-false}
+      - ICODOS_REMINDERS_DRY_RUN=${ICODOS_REMINDERS_DRY_RUN:-true}
 
   postgres:
     image: postgres:16

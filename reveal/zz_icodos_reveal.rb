@@ -45,9 +45,14 @@ Rails.application.config.after_initialize do
         Rails.logger.error('[icodos-reveal] enabled but the controller patch is NOT attached — ' \
                            'the password dialog will be shown to users who have no password')
       end
+    elsif ENV[IcodosReveal::ENV_FLAG].to_s.strip.casecmp('true').zero?
+      # Opted in but not ready. At boot this is almost always Redis still
+      # starting inside the container, which resolves itself — the probe is
+      # retried on the first real request and no longer poisons the process.
+      Rails.logger.info('[icodos-reveal] opted in but not ready yet (most likely Redis is still starting). ' \
+                        'It will re-check on first use; run the smoke check if it persists.')
     else
-      Rails.logger.info("[icodos-reveal] disabled (#{IcodosReveal::ENV_FLAG} is not true, " \
-                        'SSO is unconfigured, or the cache cannot enforce single use)')
+      Rails.logger.info("[icodos-reveal] disabled (#{IcodosReveal::ENV_FLAG} is not true)")
     end
   rescue StandardError => e
     Rails.logger.error("[icodos-reveal] boot diagnostic failed (#{e.class}: #{e.message})")

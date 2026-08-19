@@ -464,6 +464,74 @@ If you add files to `lib/`, name them for the constant they define, and watch th
 
 Part of the modified source published for AGPL-3.0 compliance. DocuSeal attribution in the interactive UI is untouched.
 
+## Automatic reminders
+
+DocuSeal ships automatic reminders in Pro only. The community build has the reminder email template, its per-template override and a `send_reminder_email` audit event type — but nothing that schedules or sends, and a settings form writing `submitter_reminders`, a key nothing reads. On this instance that key held `{two_days, four_days, six_days}` and had sent exactly zero reminders while thirteen submissions sat unsigned. Anyone reading the settings page would reasonably have believed reminders were on.
+
+This adds the scheduler, the sender, and a settings page that says what is actually happening.
+
+### Design follows researched behaviour, not invention
+
+| Product | Default | Borrowed here |
+|---|---|---|
+| DocuSign | every 3 days until signed; 120-day expiry | max one reminder per person per day |
+| Dropbox Sign | 3 and 7 days after sending; also 3 and 7 days *before* an expiry | never within an hour of any previous reminder, manual included; deadline-anchored reminders |
+| Adobe Acrobat Sign | daily / weekdaily / every other / weekly, "until signed" | **"only the current recipients are notified"** — order awareness |
+| RightSignature | — | 30-reminder ceiling per signer |
+
+The escalating pattern practitioners recommend — day 3, day 7, then daily — is not offered natively by any of them, so it is the default here.
+
+### The policy model
+
+One list of hour offsets plus an optional steady interval expresses every cadence above:
+
+```
+DocuSign default      schedule [72],      then_every_hours 72
+Dropbox Sign default  schedule [72, 168], no steady phase
+Adobe weekly-until    schedule [168],     then_every_hours 168
+Escalating (default)  schedule [72, 168], then_every_hours 24
+```
+
+Stored per submission in `submissions.preferences`, with an account default in an `AccountConfig`. No migration.
+
+**Order awareness matters most.** With `submitters_order = 'preserved'`, only the signer whose turn it is gets reminded. Chasing an employee before ICODOS has countersigned is worse than not reminding at all.
+
+**Caps no policy can override:** one per person per day, never within an hour of a previous send, 30 per signer, 200 per sweep. A wrong policy must send fewer emails than intended, never more.
+
+### The sweep
+
+Host cron every 15 minutes, enqueuing through `rails runner`. Not a self-rescheduling Sidekiq job: that needs no gem but dies silently if Redis is flushed, and a reminder engine that quietly stops is the exact failure this work exists to fix.
+
+A Redis lock stops two sweeps double-sending. A heartbeat (`last_swept_at`) makes a dead cron loud — the smoke check fails on it and the settings page says so in red.
+
+**The cron entry lives on the host, outside this repo and outside git.** It will be lost on a host rebuild. See the admin runbook.
+
+### Two defects worth remembering
+
+**Spring-forward DST.** Advancing a daily interval by 86,400 seconds moves 09:00 to 10:00 across the March transition, because that day is 23 hours long. Whole-day steps advance in calendar terms instead. The autumn case had been passing only by luck — it landed at 08:00, before the sending window, and the window shift happened to correct it. `reminders/selftest.rb` covers both directions.
+
+**Per-submitter counters need their own preferences key.** Most submissions inherit the account default and carry no policy. Writing counters into the policy key leaves behind a hash containing only counters, which is then read *as* the policy and rejected for having no anchor — so reminders stop after exactly one per submission, for a reason nobody would guess.
+
+### Tests
+
+```bash
+ruby reminders/selftest.rb        # nothing sends; needs no tenant
+# in the container, for real tz data:
+docker compose exec app bin/rails runner 'require "icodos_reminders_selftest"; IcodosRemindersSelftest.call'
+docker compose exec app bin/rails runner 'require "icodos_reminder_check"; IcodosReminderCheck.call'
+```
+
+### Environment variables (in `/opt/docuseal/.env`, not in this repo)
+
+| Variable | Notes |
+|---|---|
+| `ICODOS_REMINDERS_ENABLED` | `false` unless explicitly `true` |
+| `ICODOS_REMINDERS_DRY_RUN` | **Defaults to true.** Sending requires setting it to `false` explicitly, so a half-finished deployment cannot start emailing employees |
+
+### AGPL note
+
+Part of the modified source published for AGPL-3.0 compliance. DocuSeal attribution in the interactive UI is untouched.
+
 ## Updating DocuSeal itself
 
 The image is version-pinned, so updates are deliberate:

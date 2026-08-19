@@ -450,3 +450,67 @@ Worse, files under `lib/` must be named for the constant they define: `lib/icodo
 ```bash
 ssh root@31.70.107.24 'cd /opt/docuseal && docker compose logs app --since 60s | grep -iE "error|zeitwerk|FATAL"'
 ```
+
+---
+
+## 10. Automatic signature reminders
+
+Overlay code lives in `/opt/docuseal/reminders` and is published in the branding repo. Design and research are in `20260815-DocuSeal-Reminder engine design-v1.md`.
+
+### The scheduled task is NOT in git
+
+This is the part that will be lost on a host rebuild:
+
+```bash
+crontab -l | grep -A1 'reminder sweep'
+```
+
+It should read:
+
+```
+*/15 * * * * cd /opt/docuseal && /usr/bin/docker compose exec -T -w /app app rails runner "IcodosReminderSweep.call" >> /var/log/icodos-reminders.log 2>&1
+```
+
+If it is missing, reminders silently stop. The settings page shows a red warning after two hours without a check, and the smoke check fails — but only if someone looks.
+
+### Turning it on and off
+
+```bash
+# stop sending immediately, keep the schedule and history
+ssh root@31.70.107.24 'cd /opt/docuseal && sed -i "s/^ICODOS_REMINDERS_DRY_RUN=.*/ICODOS_REMINDERS_DRY_RUN=true/" .env && docker compose up -d'
+
+# off entirely
+ssh root@31.70.107.24 'cd /opt/docuseal && sed -i "s/^ICODOS_REMINDERS_ENABLED=.*/ICODOS_REMINDERS_ENABLED=false/" .env && docker compose up -d'
+```
+
+Dry run defaults to **true**. Sending requires setting it to `false` explicitly.
+
+### Checks
+
+```bash
+ssh root@31.70.107.24 'cd /opt/docuseal && docker compose exec -T -w /app app rails runner "require \"icodos_reminder_check\"; IcodosReminderCheck.call"'
+tail -20 /var/log/icodos-reminders.log
+```
+
+`sweep sent: N due` means live. `sweep dry_run: N due` means nothing was emailed.
+
+### Reading the log
+
+| Line | Meaning |
+|---|---|
+| `enabled, LIVE` / `enabled, DRY RUN` | mode, at boot |
+| `sweep sent: 0 due` | ran, nothing was due — the normal quiet case |
+| `SENT submission=N to=…` | a reminder was emailed |
+| `ESCALATED submission=N to=…` | the sender was told instead; the signer is now left alone |
+| `WOULD SEND …` | dry run only |
+| `sweep already running, skipping` | the Redis lock held; normal if two sweeps overlap, suspicious if constant |
+
+### Where the settings are
+
+`/settings/notifications` → *Sign Request Email Reminders*. Four choices, nothing else. Per-document schedules, stop-dates and deadline anchoring are set through the MCP tool, not the page — a date cannot be an account-wide default.
+
+The page shows red text only when reminders are **not** reaching anyone: test mode, a stalled scheduler, or the engine switched off. Silence there means it is working.
+
+### Known behaviour, not a bug
+
+Reminders follow the signing order. With `submitters_order = preserved` only the person whose turn it is is reminded, so an employee is never chased before ICODOS has countersigned.

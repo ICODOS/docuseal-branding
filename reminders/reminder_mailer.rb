@@ -58,6 +58,34 @@ class IcodosReminderMailer < SubmitterMailer
     end
   end
 
+  # Tells the SENDER, once, instead of chasing the signer again. After a few
+  # unanswered reminders more email to the same person is not the useful action;
+  # a human deciding what to do is.
+  #
+  # Plain text with an explicit body, so this needs no view template and
+  # therefore no extra mounted file.
+  def escalation_email(submitter, to:, sent_count:)
+    submission = submitter.submission
+    name = submission.template&.name.presence || submission.name.presence || "submission #{submission.id}"
+    waited = ((Time.current - submitter.sent_at) / 86_400.0).round if submitter.sent_at
+
+    body = <<~TEXT
+      #{submitter.name.presence || submitter.email} has not signed "#{name}".
+
+      Reminders sent so far: #{sent_count}
+      Waiting since: #{submitter.sent_at&.to_date} (#{waited} days)
+      Their address: #{submitter.email}
+
+      No further reminders will be sent for now. If it still needs signing, a
+      direct word is probably more use than another email.
+
+      #{Rails.application.routes.url_helpers.submission_url(submission, **Docuseal.default_url_options)}
+    TEXT
+
+    mail(to: to, subject: "Still unsigned after #{sent_count} reminders: #{name}",
+         body: body, content_type: 'text/plain')
+  end
+
   private
 
   # Avoids "Reminder: Reminder:" when someone has already written the word into

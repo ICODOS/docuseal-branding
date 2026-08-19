@@ -88,6 +88,12 @@ services:
       - ./reminders/reminder_check.rb:/app/lib/icodos_reminder_check.rb:ro
       - ./reminders/selftest.rb:/app/lib/icodos_reminders_selftest.rb:ro
       - ./reminders/reminder_mailer.rb:/app/app/mailers/icodos_reminder_mailer.rb:ro
+      - ./reminders/reminders_controller.rb:/app/app/controllers/icodos/reminders_controller.rb:ro
+      # Replaces the "unlock with DocuSeal Pro" upsell and the form writing a key
+      # nothing reads. Check both on every version bump — a stale view override
+      # renders an old layout with no error.
+      - ./reminders/notifications_reminder_banner.html.erb:/app/app/views/notifications_settings/_reminder_banner.html.erb:ro
+      - ./reminders/notifications_reminder_form.html.erb:/app/app/views/notifications_settings/_reminder_form.html.erb:ro
       - ./reminders/zz_icodos_reminders.rb:/app/config/initializers/zz_icodos_reminders.rb:ro
       # --- end Reminders ---
     environment:

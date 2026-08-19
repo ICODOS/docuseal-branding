@@ -225,16 +225,37 @@ module IcodosReminderSweep
     :sent
   end
 
-  # NOT YET EMAILING. Escalation is the remaining piece of step 3: after N
-  # unanswered reminders the sender should be told rather than the signer chased
-  # again. Logged at error level for now so it is visible in the same place as
-  # everything else and cannot pass unnoticed as "handled".
+  # Tells the sender once, and records it so it is not repeated on every
+  # subsequent sweep. Never raises: an escalation failing must not undo a
+  # reminder that has already gone out.
   def escalate!(item)
-    Rails.logger.error(
-      "[icodos-reminders] ESCALATION DUE (not yet emailed) submission=#{item[:submission].id} " \
-      "signer=#{item[:submitter].email} unanswered=#{item[:sent_count]} " \
-      "sender=#{item[:submission].created_by_user&.email}"
-    )
+    submission = item[:submission]
+    to = submission.created_by_user&.email
+
+    if to.blank?
+      Rails.logger.error("[icodos-reminders] cannot escalate submission=#{submission.id}: no sender address")
+
+      return
+    end
+
+    prefs = submission.preferences.to_h
+    state = prefs[IcodosReminders::STATE_KEY].to_h
+
+    if state['escalated_at'].present?
+      Rails.logger.info("[icodos-reminders] already escalated submission=#{submission.id}")
+
+      return
+    end
+
+    IcodosReminderMailer.escalation_email(item[:submitter], to: to, sent_count: item[:sent_count] + 1).deliver_now!
+
+    state['escalated_at'] = Time.current.utc.iso8601
+    submission.update!(preferences: prefs.merge(IcodosReminders::STATE_KEY => state))
+
+    Rails.logger.info("[icodos-reminders] ESCALATED submission=#{submission.id} to=#{to}")
+  rescue StandardError => e
+    Rails.logger.error("[icodos-reminders] escalation failed for submission=#{item[:submission].id}: " \
+                       "#{e.class}: #{e.message}")
   end
 
   # Sends one reminder for one submitter, ignoring the dry-run flag and whether
@@ -280,6 +301,27 @@ module IcodosReminderSweep
     Sidekiq.redis { |c| c.call('SET', HEARTBEAT_KEY, now.utc.iso8601, 'EX', 7 * 24 * 3600) }
   rescue StandardError
     nil
+  end
+
+  # Everything the settings page needs to answer "is this actually working?" —
+  # the question the old Pro placeholder answered wrongly for weeks.
+  def status(account)
+    last = last_swept_at
+
+    {
+      enabled: IcodosReminders.enabled?,
+      dry_run: IcodosReminders.dry_run?,
+      last_swept_at: last,
+      stale: last.nil? || last < 2.hours.ago,
+      pending: candidates_scope.where(account_id: account.id).count,
+      sent_total: SubmissionEvent.where(account_id: account.id, event_type: 'send_reminder_email').count,
+      due_now: IcodosReminders.enabled? ? call(dry_run: true)[:due] : 0
+    }
+  rescue StandardError => e
+    Rails.logger.error("[icodos-reminders] status failed (#{e.class}: #{e.message})")
+
+    { enabled: false, dry_run: true, last_swept_at: nil, stale: true, pending: 0, sent_total: 0, due_now: 0,
+      error: "#{e.class}: #{e.message}" }
   end
 
   def last_swept_at

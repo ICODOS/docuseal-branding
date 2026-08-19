@@ -11,6 +11,14 @@
 #
 # ROLLBACK: ICODOS_REMINDERS_ENABLED=false and `docker compose up -d`.
 
+# config/routes.rb is not patched — appended, the same pattern the SSO, Phase D
+# and Phase E overlays use. The form partial posts here rather than to
+# NotificationsSettingsController, which permits only two AccountConfig keys and
+# would have silently dropped ours.
+Rails.application.routes.append do
+  post '/settings/reminders', to: 'icodos/reminders#create', as: :icodos_reminders
+end
+
 Rails.application.config.after_initialize do
   begin
     if IcodosReminders.enabled?

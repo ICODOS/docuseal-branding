@@ -146,8 +146,40 @@ module IcodosReminderSweep
 
   def state_for(submission, submitter)
     submission.preferences.to_h
-              .dig(IcodosReminders::POLICY_KEY, 'per_submitter', submitter.uuid)
+              .dig(IcodosReminders::STATE_KEY, 'per_submitter', submitter.uuid)
               .to_h
+  end
+
+  def record_sent!(submission, submitter, at:)
+    prefs = submission.preferences.to_h
+    state = prefs[IcodosReminders::STATE_KEY].to_h
+    per = state['per_submitter'].to_h
+    mine = per[submitter.uuid].to_h
+
+    per[submitter.uuid] = {
+      'sent_count' => mine['sent_count'].to_i + 1,
+      'last_sent_at' => at.utc.iso8601
+    }
+
+    state['per_submitter'] = per
+    state['last_sent_at'] = at.utc.iso8601
+
+    submission.update!(preferences: prefs.merge(IcodosReminders::STATE_KEY => state))
+  end
+
+  # Recorded as a SubmissionEvent so a reminder appears in the submission's own
+  # timeline in the DocuSeal UI, next to the invitation and the signature. The
+  # event type already exists upstream and had never been written by anything.
+  def log_event!(submitter)
+    SubmissionEvent.create!(
+      submission_id: submitter.submission_id,
+      submitter_id: submitter.id,
+      account_id: submitter.submission.account_id,
+      event_type: 'send_reminder_email'
+    )
+  rescue StandardError => e
+    # An audit row failing must not un-send an email that has already gone.
+    Rails.logger.error("[icodos-reminders] could not record the audit event: #{e.class}: #{e.message}")
   end
 
   def escalate?(policy, sent_count)
@@ -166,13 +198,62 @@ module IcodosReminderSweep
     )
   end
 
-  # Step 3. Deliberately not implemented yet, and deliberately loud rather than
-  # a silent no-op: flipping ICODOS_REMINDERS_DRY_RUN=false before the mailer
-  # exists should fail visibly, not look like a working system sending nothing.
+  # Sends, then records. In that order deliberately: if recording fails we have
+  # an email out and a log line saying so, which is recoverable. If it were the
+  # other way round a failed send would look like a successful one and the
+  # person would never be chased again.
   def deliver!(item)
-    raise NotImplementedError,
-          'reminder delivery is not implemented yet (step 3). Leave ICODOS_REMINDERS_DRY_RUN unset or true; ' \
-          "submission #{item[:submission].id} would have been reminded at #{item[:due_at].iso8601}."
+    submitter = item[:submitter]
+    policy = item[:policy]
+
+    IcodosReminderMailer.reminder_email(
+      submitter,
+      note: policy['note'],
+      sent_count: item[:sent_count]
+    ).deliver_now!
+
+    record_sent!(item[:submission], submitter, at: Time.current)
+    log_event!(submitter)
+
+    Rails.logger.info(
+      "[icodos-reminders] SENT submission=#{item[:submission].id} to=#{submitter.email} " \
+      "reminder=#{item[:sent_count] + 1}"
+    )
+
+    escalate!(item) if item[:escalate]
+
+    :sent
+  end
+
+  # NOT YET EMAILING. Escalation is the remaining piece of step 3: after N
+  # unanswered reminders the sender should be told rather than the signer chased
+  # again. Logged at error level for now so it is visible in the same place as
+  # everything else and cannot pass unnoticed as "handled".
+  def escalate!(item)
+    Rails.logger.error(
+      "[icodos-reminders] ESCALATION DUE (not yet emailed) submission=#{item[:submission].id} " \
+      "signer=#{item[:submitter].email} unanswered=#{item[:sent_count]} " \
+      "sender=#{item[:submission].created_by_user&.email}"
+    )
+  end
+
+  # Sends one reminder for one submitter, ignoring the dry-run flag and whether
+  # the schedule says it is due. This is how the first live reminder was sent,
+  # deliberately and one at a time, rather than by flipping the global flag and
+  # letting the sweep loose on everything pending.
+  def send_one!(submission_id, email)
+    submission = Submission.find(submission_id)
+    submitter = submission.submitters.find { |s| s.email.to_s.casecmp(email.to_s).zero? }
+
+    raise ArgumentError, "no submitter #{email.inspect} on submission #{submission_id}" if submitter.nil?
+    raise ArgumentError, 'that submitter has already completed' if submitter.completed_at?
+
+    policy = policy_for(submission) || IcodosReminders.preset('standard')
+    state = state_for(submission, submitter)
+
+    deliver!(submission: submission, submitter: submitter, policy: policy,
+             sent_count: state['sent_count'].to_i, due_at: Time.current,
+             escalate: escalate?(policy, state['sent_count'].to_i))
   end
 
   # ------------------------------------------------------------- lock and beat

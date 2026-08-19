@@ -37,6 +37,16 @@ module IcodosReminders
   POLICY_KEY = 'icodos_reminders'
   ACCOUNT_DEFAULT_KEY = 'icodos_reminder_policy'
 
+  # Per-submitter counters live under a SEPARATE key from the policy.
+  #
+  # Not cosmetic: most submissions have no policy of their own and inherit the
+  # account default. If state were written into POLICY_KEY, the first send would
+  # leave behind a hash containing only counters, policy_for would then read
+  # that as the submission's policy instead of falling back to the account
+  # default, and normalize would reject it for having no anchor. Reminders would
+  # stop after exactly one, per submission, for a reason nobody would guess.
+  STATE_KEY = 'icodos_reminder_state'
+
   DEFAULT_TZ = 'Europe/Berlin'
   DEFAULT_WINDOW = { 'tz' => DEFAULT_TZ, 'from' => '09:00', 'to' => '17:00', 'weekdays_only' => true }.freeze
 

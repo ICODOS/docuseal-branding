@@ -1,51 +1,43 @@
 <%# ICODOS override of notifications_settings/_reminder_banner.html.erb
-    Upstream renders only the "unlock with DocuSeal Pro" upsell. Reminders work
-    on this instance, so this states plainly whether they are running.
+    Upstream renders the "unlock with DocuSeal Pro" upsell, which does not apply
+    here.
+
+    RENDERS NOTHING WHEN ALL IS WELL. Counts, "last checked" and other status
+    were removed on request: they are noise on a settings page, and the numbers
+    change on their own so they read as clutter rather than information.
+
+    What remains are the two states a person must not miss, because in both of
+    them reminders are NOT reaching anyone:
+      - test mode, where the schedule is worked out but no email is sent
+      - a stalled scheduler, which is the exact failure this feature exists to
+        prevent (something that looks switched on and quietly stopped)
 
     ONLY USE TAILWIND/DAISYUI CLASSES DOCUSEAL ALREADY USES SOMEWHERE. The CSS in
     /app/public/packs is precompiled and Tailwind purged the rest, so an unused
     class silently does nothing — no error, just wrong layout. gap-x-6, gap-x-3,
-    alert-error, alert-warning, md:join-horizontal and leading-snug are all
-    absent. Verify before using:
+    alert-error, alert-warning, md:join-horizontal and leading-snug are absent.
+    Verify before using:
       grep -F 'the-class' /app/public/packs/css/application-*.css
 
     CHECK ON EVERY DOCUSEAL VERSION BUMP — a stale override renders silently.
 %>
 <% status = IcodosReminderSweep.status(current_account) rescue { error: 'unavailable' } %>
 
-<div class="mt-2 mb-4 text-sm">
-  <% if status[:error] %>
-    <p class="text-red-400 font-bold">Reminder status is unavailable: <%= status[:error] %></p>
-
-  <% elsif !status[:enabled] %>
-    <p><strong>Reminders are switched off.</strong> Nobody is being chased about an unsigned document.</p>
-
-  <% else %>
-    <p>
-      <strong>Reminders are on.</strong>
-      <%= status[:pending] %> document<%= 's' unless status[:pending] == 1 %>
-      <%= status[:pending] == 1 ? 'is' : 'are' %> waiting to be signed.
-      <%= status[:sent_total] %> reminder<%= 's' unless status[:sent_total] == 1 %>
-      <%= status[:sent_total] == 1 ? 'has' : 'have' %> been sent so far.
-    </p>
-
-    <% if status[:dry_run] %>
-      <p class="mt-1 text-red-400 font-bold">
-        Test mode: reminders are worked out and written to the log, but no email is actually sent.
-      </p>
-    <% end %>
-
-    <% if status[:stale] %>
-      <%# The failure this whole feature exists to prevent: something that looks
-          switched on and quietly stopped. %>
-      <p class="mt-1 text-red-400 font-bold">
-        Nothing has been checked for over two hours, so reminders are not going out.
-        The scheduled task on the server has probably stopped.
-      </p>
-    <% else %>
-      <p class="mt-1 opacity-70">
-        Last checked <%= time_ago_in_words(status[:last_swept_at]) %> ago.
-      </p>
-    <% end %>
-  <% end %>
-</div>
+<% if status[:error] %>
+  <p class="mt-2 mb-2 text-sm text-red-400 font-bold">
+    Reminder status is unavailable: <%= status[:error] %>
+  </p>
+<% elsif status[:enabled] && status[:dry_run] %>
+  <p class="mt-2 mb-2 text-sm text-red-400 font-bold">
+    Test mode: reminders are worked out but no email is actually sent.
+  </p>
+<% elsif status[:enabled] && status[:stale] %>
+  <p class="mt-2 mb-2 text-sm text-red-400 font-bold">
+    Nothing has been checked for over two hours, so reminders are not going out.
+    The scheduled task on the server has probably stopped.
+  </p>
+<% elsif !status[:enabled] %>
+  <p class="mt-2 mb-2 text-sm text-red-400 font-bold">
+    Reminders are switched off on the server, so nobody is being chased.
+  </p>
+<% end %>

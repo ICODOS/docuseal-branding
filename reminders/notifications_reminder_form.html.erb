@@ -2,14 +2,18 @@
     Upstream is three dropdowns writing `submitter_reminders`, a key nothing in
     the community build reads.
 
-    Deliberately four plain choices and one sentence of consequence. No preset
-    code-names, no hidden panel, no toggle. Each option says what it does, so
-    nobody has to read a legend to compare them. Anything more specific is set
-    per document through the MCP tool, where it belongs — a per-document date
-    cannot be an account-wide default.
+    Four self-describing choices and nothing else. No preset code-names, no
+    hidden panel, no toggle, no prose.
 
-    The sentence underneath is produced by IcodosReminders.describe, the same
-    code that does the scheduling, so it cannot drift from the behaviour.
+    Everything explanatory was deliberately removed. The "for a document sent
+    today the first reminder would be..." line in particular was misleading: the
+    real date depends on when each document was sent, so a single hypothetical
+    date invited people to expect the wrong thing. The h2 above already says what
+    this section is.
+
+    Anything more specific than these four options is set per document through
+    the MCP tool, which is also the only place a per-document deadline can be
+    supplied — a deadline cannot be an account-wide default.
 
     NO JAVASCRIPT IS ADDED. <submit-form data-on="change"> is DocuSeal's own
     element, used by the toggle at the top of this page.
@@ -28,20 +32,9 @@
     ['standard',     'After 3 days, then after 7 days, then once a day'],
     ['until_signed', 'Once a week, until they sign']
   ]
-
-  first_reminder = begin
-    IcodosReminders.upcoming(policy: default, sent_at: Time.current, now: Time.current, limit: 1).first
-  rescue StandardError
-    nil
-  end
-
-  window = (default || {})['window'] || IcodosReminders::DEFAULT_WINDOW
-  escalate = (default || {})['escalate_after']
 %>
 
 <%= form_tag icodos_reminders_path, method: :post, autocomplete: 'off' do %>
-  <p class="mb-2">Someone has not signed. When should they be reminded?</p>
-
   <submit-form data-on="change">
     <div class="space-y-2">
       <% choices.each do |value, label| %>
@@ -52,6 +45,9 @@
         </label>
       <% end %>
 
+      <%# Shown only when a schedule was set through the MCP tool that none of the
+          four options represents, so the page never displays a selection that is
+          not the one in force. %>
       <% if selected == 'custom' %>
         <label class="label cursor-pointer justify-start gap-3">
           <input type="radio" name="icodos_reminders[preset]" value="custom" class="radio" checked>
@@ -60,31 +56,4 @@
       <% end %>
     </div>
   </submit-form>
-
-  <div class="mt-3 text-sm">
-    <% if first_reminder %>
-      <p>
-        For a document sent today, the first reminder would go out on
-        <strong><%= first_reminder.in_time_zone(ActiveSupport::TimeZone[window['tz']]).strftime('%A %-d %B at %H:%M') %></strong>.
-      </p>
-    <% else %>
-      <p>No reminders will be sent.</p>
-    <% end %>
-
-    <% if selected != 'off' %>
-      <p class="mt-1 opacity-70">
-        Only
-        <%= window['weekdays_only'] ? 'Monday to Friday' : 'any day' %>,
-        between <%= window['from'] %> and <%= window['to'] %> (<%= window['tz'] %>),
-        and never more than one a day to the same person.
-        <% if escalate %>
-          After <%= escalate %> without an answer you are emailed instead, and the signer is left alone.
-        <% end %>
-      </p>
-    <% end %>
-
-    <p class="mt-1 opacity-70">
-      Documents already sent keep the schedule they went out with. This only affects new ones.
-    </p>
-  </div>
 <% end %>

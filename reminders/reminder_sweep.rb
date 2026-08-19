@@ -303,25 +303,25 @@ module IcodosReminderSweep
     nil
   end
 
-  # Everything the settings page needs to answer "is this actually working?" —
-  # the question the old Pro placeholder answered wrongly for weeks.
-  def status(account)
+  # Cheap by design. An earlier version ran a full dry-run sweep here to show a
+  # "due right now" count, which meant every view of the settings page swept all
+  # submissions AND took the sweep lock — so a page load could make the real cron
+  # sweep skip itself as "already running", and every page view wrote a
+  # "sweep dry_run" line to the log. The counts were removed from the UI, so the
+  # sweep went with them. This now touches Redis once and nothing else.
+  def status(_account = nil)
     last = last_swept_at
 
     {
       enabled: IcodosReminders.enabled?,
       dry_run: IcodosReminders.dry_run?,
       last_swept_at: last,
-      stale: last.nil? || last < 2.hours.ago,
-      pending: candidates_scope.where(account_id: account.id).count,
-      sent_total: SubmissionEvent.where(account_id: account.id, event_type: 'send_reminder_email').count,
-      due_now: IcodosReminders.enabled? ? call(dry_run: true)[:due] : 0
+      stale: last.nil? || last < 2.hours.ago
     }
   rescue StandardError => e
     Rails.logger.error("[icodos-reminders] status failed (#{e.class}: #{e.message})")
 
-    { enabled: false, dry_run: true, last_swept_at: nil, stale: true, pending: 0, sent_total: 0, due_now: 0,
-      error: "#{e.class}: #{e.message}" }
+    { enabled: false, dry_run: true, last_swept_at: nil, stale: true, error: "#{e.class}: #{e.message}" }
   end
 
   def last_swept_at

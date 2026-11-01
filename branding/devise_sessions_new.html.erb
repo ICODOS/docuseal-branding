@@ -1,14 +1,33 @@
-<%# ICODOS sign-in page. Navbar is hidden on unauth pages, so the centered %>
-<%# ICODOS logo here is the only brand on the page. Microsoft SSO is the %>
-<%# primary CTA; the password form is styled as a secondary fallback inside %>
-<%# the same card so the visual hierarchy stays clear. %>
+<%# ICODOS override of app/views/devise/sessions/new.html.erb %>
+<%#
+  The navbar is hidden on unauthenticated pages, so the centred ICODOS logo
+  here is the only brand on the page. Microsoft SSO is the primary action; the
+  password form is the break-glass fallback and is styled as secondary inside
+  the same card so the hierarchy stays clear.
+
+  This page only renders when password login is allowed: with SSO_ENFORCE on
+  and no break-glass, the SSO filter redirects GET /sign_in to /auth/entra
+  before it is reached. So the password form never needs to hide itself.
+
+  No autofocus. Upstream focuses the email field; here the expected action is
+  the Microsoft button, and stealing focus to a fallback field below it is
+  wrong.
+
+  /auth/entra is a literal for the same reason as on the landing page: the
+  documented SSO rollback removes the route helper.
+
+  ONLY USE CLASSES DOCUSEAL ALREADY USES, and check them against the
+  precompiled CSS before adding any. See the note in pages_landing.html.erb.
+
+  CHECK THIS FILE ON EVERY DOCUSEAL VERSION BUMP.
+%>
 <%= content_for(:canonical_url, new_user_session_url) %>
 
 <div class="max-w-md mx-auto px-4" style="padding-top: 4rem; padding-bottom: 3rem;">
   <%= render 'devise/shared/select_server' if Docuseal.multitenant? %>
 
   <div class="text-center" style="margin-bottom: 2rem;">
-    <img src="/icodos-logo.png" alt="ICODOS" style="height: 2.75rem; width: auto;" class="mx-auto">
+    <img src="/icodos-logo.png" alt="ICODOS" width="732" height="255" decoding="async" class="mx-auto" style="height: 2.75rem; width: auto; object-fit: contain;">
   </div>
 
   <div class="card bg-base-200 rounded-2xl">
@@ -21,12 +40,11 @@
         Use your ICODOS Microsoft account
       </p>
 
-      <div style="margin-top: 1.75rem; margin-bottom: 0.5rem;">
-        <div class="border-t border-base-300"></div>
+      <%# DaisyUI's own divider: one element for the rule and its label, instead %>
+      <%# of a border and a separately positioned caption. %>
+      <div class="divider uppercase text-xs text-gray-500 mt-5 mb-2">
+        or continue with password
       </div>
-      <p class="text-center text-xs text-gray-400" style="margin-top: 0.75rem; margin-bottom: 1.25rem; letter-spacing: 0.08em;">
-        OR CONTINUE WITH PASSWORD
-      </p>
 
       <%= form_for(resource, as: resource_name, html: { class: 'space-y-4' }, data: { turbo: params[:redir].blank? }, url: session_path(resource_name)) do |f| %>
         <%= render 'hidden_fields' %>

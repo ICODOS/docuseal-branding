@@ -4,6 +4,8 @@ Branding overlay for our self-hosted [DocuSeal](https://github.com/docusealco/do
 
 **For everyday admin tasks — adding staff, rotating the Entra client secret, break-glass, running the MCP OAuth connector — see [`20260807-DocuSeal-Entra admin runbook-v1.md`](./20260807-DocuSeal-Entra%20admin%20runbook-v1.md).** This README documents *what's in the overlay* and *how to deploy it*; the runbook covers the recurring operations.
 
+**For a DocuSeal version bump, see [`20261101-DocuSeal-Version bump 3.3.4 runbook-v1.md`](./20261101-DocuSeal-Version%20bump%203.3.4%20runbook-v1.md).** It covers the 3.1.6 to 3.3.4 bump specifically, and the shape of it carries over to the next one.
+
 ## What is changed
 
 | File | Purpose |
@@ -25,9 +27,13 @@ Branding overlay for our self-hosted [DocuSeal](https://github.com/docusealco/do
 | `mcp/oauth_controller.rb` | Phase D — `/oauth/authorize` and the consent screen |
 | `mcp/oauth_consent.html.erb` | Phase D — the consent page (self-contained, no app layout) |
 | `mcp/zz_mcp_oauth.rb` | Phase D — initializer: routes, log filtering, boot diagnostics, the `/mcp` hook |
+| `contracts/*` | Phase E — SharePoint contract filing: the two ICODOS MCP tools, the `/icodos/hooks/filing` hook, the Graph client and its checks |
+| `reveal/*` | SSO API key reveal: re-authenticate with Microsoft instead of typing a password nobody has |
+| `reminders/*` | Signature reminders, which DocuSeal ships only in Pro: scheduler, sweep, mailer, settings page |
+| `deploy.sh` | Refreshes **every** overlay directory on the server, dumps the database first, and refuses to start if a bind-mount source is missing |
 | `docker-compose.yml` | Stock compose file plus the overlay mounts, SSO + MCP OAuth env vars, and a pinned image version |
 
-Everything else — application code, database, TLS, email templates — is the unmodified official image `docuseal/docuseal` (pinned, currently `3.1.6`). Email wording, policy links, and the completion message are configured in the app's own Personalization settings, not in this repo.
+Everything else — application code, database, TLS, email templates — is the unmodified official image `docuseal/docuseal` (pinned, currently `3.3.4`). Email wording, policy links, and the completion message are configured in the app's own Personalization settings, not in this repo.
 
 ## License compliance (AGPL-3.0)
 
@@ -85,15 +91,25 @@ The SSO layer is our own code, distributed under the same public repository. Doc
 ## Deploying / updating on the server
 
 ```bash
-cd /opt/docuseal
-git clone https://github.com/ICODOS/docuseal-branding.git tmp-branding \
-  && cp -r tmp-branding/branding . \
-  && cp -r tmp-branding/sso . \
-  && cp -r tmp-branding/mcp . \
-  && cp tmp-branding/docker-compose.yml . \
-  && rm -rf tmp-branding
-docker compose up -d --force-recreate app
+cd /opt/docuseal && curl -fsSL https://raw.githubusercontent.com/ICODOS/docuseal-branding/main/deploy.sh | bash
 ```
+
+To read the script before running it, which is the better habit:
+
+```bash
+cd /opt/docuseal && git clone --depth 1 https://github.com/ICODOS/docuseal-branding.git /tmp/overlay && less /tmp/overlay/deploy.sh && bash /tmp/overlay/deploy.sh
+```
+
+`deploy.sh` is the whole procedure. It refuses to run outside a directory holding `.env` and `secrets/`, dumps the database to `/var/backups/docuseal`, refreshes **all six** overlay directories, checks every bind-mount source, then brings the stack up and prints the ICODOS boot diagnostics. `SKIP_DB_BACKUP=1` and `REPO_REF=<branch>` are the only knobs.
+
+Two things it does that the old hand-typed command did not, and both have teeth:
+
+- **It copies every overlay directory, not just `branding/`.** `docker-compose.yml` mounts files from `branding/`, `sso/`, `mcp/`, `contracts/`, `reveal/` and `reminders/`. Copying a subset leaves the rest at whatever version the server happened to have, which is how a view override silently goes stale.
+- **It checks that every bind-mount source exists and is a file before starting anything.** Docker creates a *directory* in place of a missing bind-mount source. Rails then sees an empty directory where a controller or a key should be, and the dependent feature disables itself with no error in any log. The check turns that into a refusal to deploy.
+
+It also dumps the database first, because DocuSeal runs migrations on boot and putting the old image tag back does not reverse them.
+
+If you deploy by hand instead, do all of the above by hand.
 
 (`.env` with `HOST`, `POSTGRES_PASSWORD`, and the SSO / MCP OAuth variables from the sections above already lives in `/opt/docuseal` and is not part of this repo. `secrets/mcp_oauth_signing_key.pem` also lives only on the server — see "The signing key" below. It must exist before the first `docker compose up -d`.)
 
@@ -536,7 +552,19 @@ Part of the modified source published for AGPL-3.0 compliance. DocuSeal attribut
 
 The image is version-pinned, so updates are deliberate:
 
-1. Check the [DocuSeal releases](https://github.com/docusealco/docuseal/releases) for changes to any of the overridden files. The current overrides map to these upstream paths:
+1. Diff the overridden files between the pinned tag and the new one, rather than reading release notes. The notes do not mention view changes, and a stale view override renders an old layout with no error anywhere. From a clone of upstream:
+
+   ```bash
+   git diff <old-tag> <new-tag> -- $(sed -n 's|.*- \./[^:]*:/app/\([^:]*\):ro|\1|p' docker-compose.yml | tr '\n' ' ')
+   ```
+
+   **Also diff `app/views/**` for classes we use that upstream stopped using.** Tailwind scans `./app/views/**/*.erb` at *image build time*, before any overlay file exists, so our files are never scanned. A class upstream drops is purged from the compiled CSS and silently stops working in our overrides. 3.3.4 removed `min-w-[160px]`, which the navbar override depended on. Check any arbitrary-value or uncommon class before trusting it:
+
+   ```bash
+   docker compose exec app sh -c "grep -o 'the-class' /app/public/packs/css/application-*.css | head -1"
+   ```
+
+   The current overrides map to these upstream paths:
    - `app/views/submit_form/_docuseal_logo.html.erb`
    - `app/views/start_form/_docuseal_logo.html.erb`
    - `app/views/shared/_mailer_attribution.html.erb`
@@ -549,12 +577,16 @@ The image is version-pinned, so updates are deliberate:
    - `config/routes.rb` (SSO and MCP OAuth routes are added via `Rails.application.routes.append`, but if upstream removes any Devise route we mount an override for, we need to reconsider)
    - Also check `app/controllers/application_controller.rb` and `config/initializers/devise.rb` — SSO relies on `authenticate_user!` behavior and Devise's `SessionsController` / `PasswordsController` subclass structure staying stable.
    - **`app/controllers/mcp/mcp_base_controller.rb` — check this one on every version bump.** The Phase D hook prepends onto it and overrides `user_from_api_key` and `authenticate_user!`. If upstream renames either method, or moves auth out of that class, OAuth tokens stop being accepted at `/mcp`. It fails closed (401), not open, and the initializer logs `could not install the /mcp authentication hook`. The static Bearer path keeps working regardless.
+   - `app/views/reveal_access_token/show.html.erb`, `app/views/notifications_settings/_reminder_banner.html.erb` and `_reminder_form.html.erb` are overridden too and are missing from the list above for historical reasons; the `sed` command at the top of this step derives the full list from `docker-compose.yml` and will not miss them.
+   - **Ruby patch targets.** `sessions_controller.rb` and `passwords_controller.rb` (SSO filter), `mcp_controller.rb` and `mcp/protocol_controller.rb` (contract tools), `reveal_access_token_controller.rb` (reveal), `submitter_mailer.rb` and `account_config.rb` (reminders). The overlay adds files and patches at boot; it overwrites no upstream Ruby file. Every patch fails closed and logs, so a rename degrades a feature rather than breaking the app.
+   - **Check the migrations.** `git diff --stat <old-tag> <new-tag> -- db/migrate`. They run on boot and are not reversed by restoring the old image tag, which is why `deploy.sh` dumps the database first.
 2. Bump the version in `docker-compose.yml`, commit, deploy as above.
 3. Open sign.icodos.com and check:
    - ICODOS header renders on signed-in pages, no navbar on `/sign_in` or `/`.
+   - The user menu in the top right still opens at its normal width, with Profile, Console, Verify PDF and Sign out. A collapsed, text-width menu means a purged class.
    - `/auth/entra` still redirects to `login.microsoftonline.com`.
    - A test email has no DocuSeal footer.
    - Tab title reads "ICODOS – Document Signing".
-4. After a version bump, also confirm the MCP endpoint still responds (it is a recent DocuSeal feature), and run the Phase D smoke check in the admin runbook, section 7.
+4. After a version bump, also confirm the MCP endpoint still responds (it is a recent DocuSeal feature), and run the Phase D smoke check in the admin runbook, section 7. Run the reveal and reminder checks as well; both are one `rails runner` line and both are listed in their own sections above.
 
 Note: the server's weekly cron (`docker compose pull`) is a no-op for the pinned app image; version bumps are manual by design. A monthly automated check compares the pinned version against the latest DocuSeal release.

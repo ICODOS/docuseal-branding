@@ -1,6 +1,21 @@
 <%
   # ICODOS logo override for shared/_logo. Mirrors the local_assigns API of the
   # stock DocuSeal partial (width, height, class) so every caller keeps working.
+  #
+  # Two things the stock partial does not need, and this one does:
+  #
+  # 1. object-fit: contain. The DocuSeal mark is square; ours is a 732x255
+  #    wordmark. Callers that ask for a square box (templates_uploads/show at
+  #    50x50, submissions/_logo at 40x40) would otherwise stretch it.
+  # 2. The intrinsic size as width/height attributes. The browser derives the
+  #    aspect ratio from them and reserves the box before the file arrives,
+  #    which is what stops the header shifting on every page load.
+  #
+  # CHECK THIS FILE ON EVERY DOCUSEAL VERSION BUMP: new call sites may pass
+  # sizes this partial has not seen. Current callers in 3.3.4 are
+  # shared/_title, submissions/_logo, templates_uploads/show,
+  # templates_share_link_qr/_logo, start_form and submit_form (both overridden
+  # here) and pages/landing (overridden here).
   klass = local_assigns[:class]
   w = local_assigns[:width]
   h = local_assigns[:height]
@@ -13,5 +28,6 @@
     css << 'height: 37px'
     css << 'width: auto'
   end
+  css << 'object-fit: contain'
 %>
-<img src="/icodos-logo.png" alt="ICODOS" class="<%= klass %>" style="<%= css.join('; ') %>">
+<img src="/icodos-logo.png" alt="ICODOS" width="732" height="255" decoding="async" class="<%= klass %>" style="<%= css.join('; ') %>">

@@ -10,6 +10,8 @@
 
   CHECK THIS FILE ON EVERY DOCUSEAL VERSION BUMP — upstream restyles its views
   freely and a stale override renders an old layout without any error.
+  State 3 is rebased on upstream 3.3.4, which wrapped the form in <native-event>
+  so the Hotwire Native client receives the reveal as a turbo stream.
 %>
 <%= render 'shared/turbo_modal', title: t('reveal_api_key') do %>
   <% if @icodos_reveal_token.present? %>
@@ -26,7 +28,7 @@
     <div class="form-control">
       <p class="text-sm">
         Confirm it is you with Microsoft to reveal the API key. You will be asked to sign in again even though
-        you are already signed in here — that is deliberate, and it is what replaces the password prompt.
+        you are already signed in here; that is deliberate, and it replaces the password prompt.
       </p>
       <%# data-turbo-frame _top: this is a full-page redirect out to Microsoft and
           cannot happen inside the modal frame. %>
@@ -37,17 +39,19 @@
       </a>
     </div>
   <% else %>
-    <%= form_tag settings_reveal_access_token_path, enctype: 'multipart/form-data', data: { turbo_frame: :_top } do %>
-      <div class="form-control">
-        <%= label_tag :password, t('enter_your_password_to_reveal_the_api_key'), class: 'label' %>
-        <%= password_field_tag :password, nil, class: 'base-input', autocomplete: 'current-password', required: true, autofocus: true, placeholder: t('password') %>
-        <% if local_assigns[:error_message].present? %>
-          <span class="label-text-alt text-red-400 mt-1"><%= local_assigns[:error_message] %></span>
-        <% end %>
-      </div>
-      <div class="form-control mt-4">
-        <%= submit_tag t('submit'), class: 'base-button' %>
-      </div>
-    <% end %>
+    <native-event data-on="submit" data-name="native:turbo-stream" class="block">
+      <%= form_tag settings_reveal_access_token_path, enctype: 'multipart/form-data', data: { turbo_frame: :_top } do %>
+        <div class="form-control">
+          <%= label_tag :password, t('enter_your_password_to_reveal_the_api_key'), class: 'label' %>
+          <%= password_field_tag :password, nil, class: 'base-input', autocomplete: 'current-password', required: true, autofocus: true, placeholder: t('password') %>
+          <% if local_assigns[:error_message].present? %>
+            <span class="label-text-alt text-red-400 mt-1"><%= local_assigns[:error_message] %></span>
+          <% end %>
+        </div>
+        <div class="form-control mt-4">
+          <%= submit_tag t('submit'), class: 'base-button' %>
+        </div>
+      <% end %>
+    </native-event>
   <% end %>
 <% end %>

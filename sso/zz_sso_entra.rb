@@ -68,6 +68,11 @@ end
 # Runs inside `to_prepare` so it re-applies after every code reload (dev) and
 # after eager-load in production. Uses `only:` to leave sign-out (destroy)
 # reachable for signed-in users.
+#
+# DocuSeal 3.3.x added a second way into SessionsController#create: an XHR JSON
+# sign-in that skips the CSRF check and answers with JSON. It is the same
+# action, so this filter already blocks it; the JSON branch below exists so the
+# caller gets a parseable refusal instead of a plain-text body.
 Rails.application.config.to_prepare do
   [SessionsController, PasswordsController].each do |controller|
     next if controller.instance_variable_get(:@_icodos_sso_patched)
@@ -79,11 +84,14 @@ Rails.application.config.to_prepare do
       define_method(:__icodos_sso_enforce) do
         return if Sso.password_login_allowed?
 
+        message = 'Password login is disabled. Please sign in with Microsoft.'
+
         if request.get?
           redirect_to '/auth/entra'
+        elsif request.format.json?
+          render json: { error: message }, status: :forbidden
         else
-          render plain: 'Password login is disabled. Please sign in with Microsoft.',
-                 status: :forbidden
+          render plain: message, status: :forbidden
         end
       end
       private :__icodos_sso_enforce

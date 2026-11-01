@@ -1,4 +1,21 @@
+<%# ICODOS override of app/views/layouts/_head_tags.html.erb %>
+<%#
+  Only the title text differs from upstream. Everything else is kept verbatim so
+  that the Hotwire Native branches upstream added in 3.3.x keep working.
+
+  Rendered by application.html.erb, plain.html.erb, form.html.erb and
+  submit_form_draw_signature/show.html.erb, so this title also covers the pages
+  external signers see.
+
+  CHECK THIS FILE ON EVERY DOCUSEAL VERSION BUMP — a stale override renders an
+  old head without any error.
+  Rebased on upstream 3.3.4.
+%>
 <title>
-  <%= content_for(:html_title) || 'ICODOS – Document Signing' %>
+  <%= turbo_native_app? ? content_for(:native_title) : (content_for(:html_title) || 'ICODOS – Document Signing') %>
 </title>
 <%= render 'shared/meta' %>
+<% if turbo_native_app? %>
+  <meta name="turbo-cache-control" content="no-preview">
+  <%= render 'layouts/native_styles' %>
+<% end %>

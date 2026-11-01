@@ -6,11 +6,20 @@
     were removed on request: they are noise on a settings page, and the numbers
     change on their own so they read as clutter rather than information.
 
-    What remains are the two states a person must not miss, because in both of
-    them reminders are NOT reaching anyone:
-      - test mode, where the schedule is worked out but no email is sent
-      - a stalled scheduler, which is the exact failure this feature exists to
-        prevent (something that looks switched on and quietly stopped)
+    What remains are the states in which reminders are NOT reaching anyone,
+    split by whether somebody chose that or it broke:
+
+      red    something is wrong and nobody decided it
+               - the status probe itself failed
+               - the scheduler has stalled, which is the exact failure this
+                 feature exists to prevent (looks switched on, quietly stopped)
+      amber  switched off deliberately, on the server, not on this page
+               - test mode: the schedule is worked out but no email is sent
+               - reminders disabled outright
+
+    The colour is a chip background rather than coloured text: coloured text at
+    these weights fails contrast on the light theme, and the four messages
+    already read differently enough to stand on their own without it.
 
     ONLY USE TAILWIND/DAISYUI CLASSES DOCUSEAL ALREADY USES SOMEWHERE. The CSS in
     /app/public/packs is precompiled and Tailwind purged the rest, so an unused
@@ -23,21 +32,22 @@
 %>
 <% status = IcodosReminderSweep.status(current_account) rescue { error: 'unavailable' } %>
 
-<% if status[:error] %>
-  <p class="mt-2 mb-2 text-sm text-red-400 font-bold">
-    Reminder status is unavailable: <%= status[:error] %>
-  </p>
-<% elsif status[:enabled] && status[:dry_run] %>
-  <p class="mt-2 mb-2 text-sm text-red-400 font-bold">
-    Test mode: reminders are worked out but no email is actually sent.
-  </p>
-<% elsif status[:enabled] && status[:stale] %>
-  <p class="mt-2 mb-2 text-sm text-red-400 font-bold">
-    Nothing has been checked for over two hours, so reminders are not going out.
-    The scheduled task on the server has probably stopped.
-  </p>
-<% elsif !status[:enabled] %>
-  <p class="mt-2 mb-2 text-sm text-red-400 font-bold">
-    Reminders are switched off on the server, so nobody is being chased.
+<%
+  severity, message =
+    if status[:error]
+      ['broken', "Reminder status is unavailable: #{status[:error]}"]
+    elsif status[:enabled] && status[:dry_run]
+      ['chosen', 'Test mode: reminders are worked out but no email is actually sent.']
+    elsif status[:enabled] && status[:stale]
+      ['broken', 'Nothing has been checked for over two hours, so reminders are not going out. ' \
+                 'The scheduled task on the server has probably stopped.']
+    elsif !status[:enabled]
+      ['chosen', 'Reminders are switched off on the server, so nobody is being chased.']
+    end
+%>
+
+<% if message %>
+  <p class="mt-2 mb-2 p-3 rounded-lg text-sm font-medium <%= severity == 'broken' ? 'bg-red-100' : 'bg-yellow-100' %>">
+    <%= message %>
   </p>
 <% end %>

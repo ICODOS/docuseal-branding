@@ -1,6 +1,10 @@
 # ICODOS-branded DocuSeal stack — sign.icodos.com
 # Based on the original /opt/docuseal/docker-compose.yml, with:
 #   1. Image pinned to a tested version (no surprise updates that could break the view overrides)
+#      Currently 3.3.4. The view overrides below are rebased on that tag; see
+#      "Deploying / updating on the server" in README.md before changing it.
+#      Nothing here is scanned by Tailwind at image build time, so a class that
+#      upstream stopped using is purged from the CSS and silently does nothing.
 #   2. Branding overlay files mounted over the stock views (see ./branding)
 #   3. Microsoft Entra SSO overlay (see ./sso)
 #   4. Phase D — MCP OAuth 2.1 authorization server (see ./mcp)
@@ -14,7 +18,7 @@
 
 services:
   app:
-    image: docuseal/docuseal:3.1.6
+    image: docuseal/docuseal:3.3.4
     restart: unless-stopped
     depends_on:
       postgres:

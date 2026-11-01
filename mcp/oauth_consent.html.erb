@@ -59,7 +59,7 @@
     <p class="lead">
       An application calling itself <strong><%= @client.name %></strong> is asking
       to use the ICODOS DocuSeal MCP server as you. If you allow it, it will act
-      with your own DocuSeal permissions &mdash; including sending documents for
+      with your own DocuSeal permissions, including sending documents for
       signature.
     </p>
 
@@ -84,8 +84,8 @@
       <div class="warn">
         This request returns the authorization to <strong><%= @redirect_host %></strong>,
         an application running on your own computer. Only continue if you started
-        this from an application you trust on this machine &mdash; any local
-        program can claim that address.
+        this from an application you trust on this machine; any local program can
+        claim that address.
       </div>
     <% end %>
 

@@ -1,4 +1,20 @@
+<%# ICODOS override of app/views/submit_form/_docuseal_logo.html.erb %>
+<%#
+  Header on the document signing page, the surface external counterparties see.
+  The "Powered by DocuSeal" line is required here: LICENSE_ADDITIONAL_TERMS asks
+  for attribution in interactive user interfaces, and this is one.
+
+  Sized with inline styles on purpose. This view is compiled into the `form`
+  CSS pack, whose Tailwind content set is narrower than the application pack's,
+  and the overlay files are never scanned at image build time either way. The
+  classes used here (mx-auto, flex, flex-col, items-center) are all present in
+  the form pack; anything new must be checked before it is used:
+    grep -F 'the-class' /app/public/packs/css/form-*.css
+
+  width/height are the file's intrinsic pixels, so the browser reserves the box
+  before the image arrives and the signing header does not jump.
+%>
 <a href="<%= root_path %>" class="mx-auto flex flex-col items-center">
-  <img src="/icodos-logo.png" alt="ICODOS" style="height: 2.2rem; width: auto;">
+  <img src="/icodos-logo.png" alt="ICODOS" width="732" height="255" decoding="async" style="height: 2.2rem; width: auto; object-fit: contain;">
   <span style="font-size: 0.65rem; color: #7e7e7e; margin-top: 0.3rem; letter-spacing: 0.03em;">Powered by DocuSeal</span>
 </a>

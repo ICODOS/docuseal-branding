@@ -132,7 +132,7 @@ cd /opt/docuseal && docker compose exec -T -w /app app rails runner 'require "ic
 **Reminders**
 
 ```bash
-cd /opt/docuseal && docker compose exec -T app bin/rails runner 'require "icodos_reminders_selftest"; IcodosRemindersSelftest.call' && docker compose exec -T app bin/rails runner 'require "icodos_reminder_check"; IcodosReminderCheck.call'
+cd /opt/docuseal && docker compose exec -T -w /app app rails runner 'require "icodos_reminders_selftest"; IcodosRemindersSelftest.call' && docker compose exec -T -w /app app rails runner 'require "icodos_reminder_check"; IcodosReminderCheck.call'
 ```
 
 13. Settings, Notifications: the four reminder choices render and the one in force is selected.
@@ -173,3 +173,22 @@ The purge trap is the thing to remember. Tailwind scans `./app/views/**/*.erb` *
 One patch was hardened rather than rebased. `SessionsController#create` gained an XHR JSON sign-in path in 3.3.x that skips the CSRF check. The SSO enforcement filter already covered that action, so it was never a hole; it now answers that caller with JSON instead of plain text.
 
 Everything else the overlay touches was verified unchanged at 3.3.4: `McpController::TOOLS`, `Mcp::McpBaseController`, `Mcp::ProtocolController`, `RevealAccessTokenController`, `PasswordsController`, every `AccountConfig` and `EncryptedConfig` key the overlay reads, every `SubmitterMailer` helper `IcodosReminderMailer` inherits, and `Submitter#template`, which is still `has_one :template, through: :submission` despite the new `template_id` column.
+
+---
+
+## 8. What the 1 November 2026 deploy actually did
+
+Run at 10:22 UTC. Record kept because the numbers set expectations for the next bump.
+
+- Image pre-pulled before touching the stack, so the only downtime was the container recreate. 3.1.6 is still on the host for rollback.
+- Database dump: 332 KB, `/var/backups/docuseal/docuseal-20261101T102234Z.sql.gz`.
+- Scale at the time: 79 submissions, 155 submitters, 88 templates. **All five migrations ran in about 30 milliseconds**, against upstream's "one to two minutes per 500,000 submissions" warning. The backfill is not a concern at this size and will not be for years.
+- The server's overlay matched repo `main` exactly before the deploy, with one stray file, `sso/entra_auth_controller.rb.bak-1786798862`, left from a manual edit on 15 August. It was never mounted, and `deploy.sh` removed it.
+- Boot diagnostics: contracts enabled, reminders enabled and LIVE, MCP OAuth enabled, reveal "opted in but not ready yet" for about two minutes while Redis started, then enabled. The SSO layer prints no line when healthy; it only warns when enforcement is on and the config is incomplete.
+
+All acceptance checks passed, including two worth recording:
+
+- **The purge trap was real, not theoretical.** `grep -c 'min-w-\[160px\]' /app/public/packs/css/application-*.css` returns **0** on the 3.3.4 image. Had the navbar override been carried over unchanged, the user menu would have opened at the width of its own text, with nothing in any log.
+- **The new XHR JSON sign-in path is blocked.** A `POST /sign_in` with `X-Requested-With: XMLHttpRequest` and `Accept: application/json` skips CSRF in 3.3.4, reaches the SSO filter, and now returns `403` with `{"error":"Password login is disabled. Please sign in with Microsoft."}`. Before the patch it would have returned the same 403 as `text/plain`.
+
+One documentation defect was found by running the checks rather than reading them: the README's reminder commands used `docker compose exec app bin/rails runner`, which fails with `stat bin/rails: no such file or directory` because the container's default working directory is not `/app`. The admin runbook had the working form all along. Every invocation in the README now reads `docker compose exec -T -w /app app rails runner`.

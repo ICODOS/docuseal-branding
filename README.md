@@ -383,7 +383,7 @@ Upload the **certificate** (public half) to the app registration. Add its expiry
 Run after any enable, key rotation, or DocuSeal version bump. `write: true` additionally round-trips a probe file and deletes it.
 
 ```bash
-docker compose exec app bin/rails runner \
+docker compose exec -T -w /app app rails runner \
   'require "icodos_graph_check"; IcodosGraphCheck.call(write: true)'
 ```
 
@@ -464,7 +464,7 @@ curl -sS https://raw.githubusercontent.com/docusealco/docuseal/refs/tags/<TAG>/a
 ### Smoke check
 
 ```bash
-docker compose exec app bin/rails runner \
+docker compose exec -T -w /app app rails runner \
   'require "icodos_reveal_check"; IcodosRevealCheck.call'
 ```
 
@@ -531,10 +531,12 @@ A Redis lock stops two sweeps double-sending. A heartbeat (`last_swept_at`) make
 ### Tests
 
 ```bash
-ruby reminders/selftest.rb        # nothing sends; needs no tenant
-# in the container, for real tz data:
-docker compose exec app bin/rails runner 'require "icodos_reminders_selftest"; IcodosRemindersSelftest.call'
-docker compose exec app bin/rails runner 'require "icodos_reminder_check"; IcodosReminderCheck.call'
+# Both run in the container. Unlike contracts/selftest.rb and reveal/selftest.rb,
+# reminders/selftest.rb only defines a module when run with plain ruby: the
+# scheduler is timezone arithmetic and needs real tzinfo data, not a laptop's.
+# Neither sends anything, touches a tenant, or writes to the database.
+docker compose exec -T -w /app app rails runner 'require "icodos_reminders_selftest"; IcodosRemindersSelftest.call'
+docker compose exec -T -w /app app rails runner 'require "icodos_reminder_check"; IcodosReminderCheck.call'
 ```
 
 ### Environment variables (in `/opt/docuseal/.env`, not in this repo)

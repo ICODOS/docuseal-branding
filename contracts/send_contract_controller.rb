@@ -110,11 +110,14 @@ module Mcp
 
     # rubocop:disable Metrics
     def call
-      return render_tool_error('Phase E is not enabled on this instance') unless IcodosGraph.enabled?
-
       @template = Template.accessible_by(current_ability).find(mcp_params['template_id'])
 
       authorize!(:read, @template)
+
+      # After authorize!, never before it: an early render ahead of authorize!
+      # trips McpBaseController's check_authorization and becomes a bare 500.
+      # See IcodosCreateContractTemplateController#call, where it did.
+      return render_tool_error('Phase E is not enabled on this instance') unless IcodosGraph.enabled?
 
       raise InvalidArguments, 'template has been archived' if @template.archived_at?
       raise InvalidArguments, 'template has no fields — nothing to sign' if @template.fields.blank?
@@ -199,6 +202,13 @@ module Mcp
     rescue IcodosGraph::Error => e
       Rails.logger.error("[icodos-contracts] send_contract: #{e.class} #{e.message}")
       render_tool_error("SharePoint: #{e.message}")
+    rescue Faraday::Error => e
+      # Only the filing-folder check talks to Microsoft, and it runs before
+      # anything is sent, so a network failure here never leaves a half-sent
+      # contract. Without this it would be a bare 500.
+      Rails.logger.error("[icodos-contracts] send_contract: #{e.class} #{e.message}")
+      render_tool_error("SharePoint could not be reached (#{e.class.name.demodulize}: #{e.message}). " \
+                        'Nothing was sent; retry in a minute.')
     end
     # rubocop:enable Metrics
 

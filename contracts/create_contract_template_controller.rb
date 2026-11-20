@@ -133,6 +133,39 @@ module Mcp
 
     # rubocop:disable Metrics
     def call
+      account = current_user.account
+
+      # AUTHORIZE FIRST, before the enabled check and before any validation.
+      #
+      # McpBaseController declares check_authorization, which CanCan enforces as
+      # an after_action: an action that finishes without having called
+      # authorize! raises CanCan::AuthorizationNotPerformed after the response
+      # is built, and the client gets a bare HTTP 500. The render_tool_error
+      # calls below are ordinary renders, not exceptions, so that after_action
+      # runs for every one of them. While authorize! sat after the SharePoint
+      # download, every argument, path and SharePoint error this tool words so
+      # carefully was replaced by that 500, which Claude's connector shows as
+      # "Bad Gateway". It stayed hidden because only failures trigger it: the
+      # logs since 2026-11-01 hold 24 successful calls and no failed one until
+      # 2026-11-20, when six failed in a row.
+      #
+      # It is also the right order regardless: SharePoint used to be read before
+      # the caller had been checked for permission to create a template.
+      #
+      # The Template rule looks only at account_id, so the unsaved record is
+      # enough to check. Name and roles are filled in once validated.
+      @template = Template.new(
+        account: account,
+        author: current_user,
+        folder: account.default_template_folder,
+        source: :mcp,
+        external_id: PHASE_E_MARKER,
+        fields: [],
+        schema: []
+      )
+
+      authorize!(:create, @template)
+
       return render_tool_error('Phase E is not enabled on this instance') unless IcodosGraph.enabled?
 
       name = mcp_params['name'].to_s.strip
@@ -172,21 +205,7 @@ module Mcp
               'Pass the PDF, not the .docx, and make sure OneDrive has finished writing it.'
       end
 
-      account = current_user.account
-
-      @template = Template.new(
-        account: account,
-        author: current_user,
-        folder: account.default_template_folder,
-        source: :mcp,
-        name: name,
-        external_id: PHASE_E_MARKER,
-        submitters: submitters,
-        fields: [],
-        schema: []
-      )
-
-      authorize!(:create, @template)
+      @template.assign_attributes(name: name, submitters: submitters)
       @template.save!
 
       documents = attach_document!(@template, bytes, File.basename(source_path))
@@ -235,6 +254,12 @@ module Mcp
       # through is what lets the caller tell "wrong path" from "lost access".
       Rails.logger.error("[icodos-contracts] create_contract_template: #{e.class} #{e.message}")
       render_tool_error("SharePoint: #{e.message}")
+    rescue Faraday::Error => e
+      # Timeouts, DNS and TLS failures on the way to Entra, Graph or SharePoint
+      # are Faraday's, not IcodosGraph's, and would otherwise be a bare 500.
+      Rails.logger.error("[icodos-contracts] create_contract_template: #{e.class} #{e.message}")
+      render_tool_error("SharePoint could not be reached (#{e.class.name.demodulize}: #{e.message}). " \
+                        'This is a network failure, not a problem with the arguments; retry in a minute.')
     end
     # rubocop:enable Metrics
 

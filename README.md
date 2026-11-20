@@ -30,7 +30,7 @@ Branding overlay for our self-hosted [DocuSeal](https://github.com/docusealco/do
 | `contracts/*` | Phase E — SharePoint contract filing: the two ICODOS MCP tools, the `/icodos/hooks/filing` hook, the Graph client and its checks |
 | `reveal/*` | SSO API key reveal: re-authenticate with Microsoft instead of typing a password nobody has |
 | `reminders/*` | Signature reminders, which DocuSeal ships only in Pro: scheduler, sweep, mailer, settings page |
-| `deploy.sh` | Refreshes **every** overlay directory on the server, dumps the database first, and refuses to start if a bind-mount source is missing |
+| `deploy.sh` | Refreshes **every** overlay directory on the server, dumps the database first, refuses to start if a bind-mount source is missing, and proves the running container sees the new files |
 | `docker-compose.yml` | Stock compose file plus the overlay mounts, SSO + MCP OAuth env vars, and a pinned image version |
 
 Everything else — application code, database, TLS, email templates — is the unmodified official image `docuseal/docuseal` (pinned, currently `3.3.4`). Email wording, policy links, and the completion message are configured in the app's own Personalization settings, not in this repo.
@@ -101,6 +101,13 @@ cd /opt/docuseal && git clone --depth 1 https://github.com/ICODOS/docuseal-brand
 ```
 
 `deploy.sh` is the whole procedure. It refuses to run outside a directory holding `.env` and `secrets/`, dumps the database to `/var/backups/docuseal`, refreshes **all six** overlay directories, checks every bind-mount source, then brings the stack up and prints the ICODOS boot diagnostics. `SKIP_DB_BACKUP=1` and `REPO_REF=<branch>` are the only knobs.
+
+Two things it does that a hand-run deploy tends to get wrong, both found on 20 November 2026:
+
+- **It recreates the app container even when only overlay files changed.** `docker compose up -d` recreates a container only when its compose configuration changes, and the contents of bind-mounted files are not part of that configuration, so a code-only deploy would leave the app running the previous files.
+- **It ends by comparing checksums.** Every overlay file on the host is compared with the file the running container has mounted at the same place, and the script fails, naming the stale files, if any differ. So `done` means the new code is live, not just copied.
+
+Piping it into bash is safe. Everything runs inside `main()`, so bash has read the whole file before any command runs. Before that, the `docker compose exec` of the database dump read the rest of the script from the pipe, and the deploy stopped silently after the dump with exit status 0.
 
 Two things it does that the old hand-typed command did not, and both have teeth:
 

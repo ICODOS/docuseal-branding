@@ -443,7 +443,7 @@ Treat the output as a password — it grants full API access to that account and
 
 ### Deployment trap
 
-The overlay's `.rb` files are bind-mounted and **Rails caches classes in production — copying a file to the server does not load it.** A `docker compose restart app` (or `up -d`) is always required.
+The overlay's `.rb` files are bind-mounted and **Rails caches classes in production — copying a file to the server does not load it.** The app container has to be recreated: `docker compose up -d --no-deps --force-recreate app`, which `deploy.sh` does by itself. A plain `up -d` is not enough when only overlay files changed. Compose recreates a container only when its configuration changes, and file contents are not part of it, so the container keeps running the previous files; `docker compose up -d --dry-run` on 20 November 2026 duly left the app container `Running`. `deploy.sh` ends by comparing every overlay file on the host with the one the running container sees.
 
 Worse, files under `lib/` must be named for the constant they define: `lib/icodos_reveal.rb` → `IcodosReveal`. A mismatch does not degrade — Zeitwerk raises, the container crash-loops, and with `SSO_ENFORCE=true` nobody can sign in. This took the instance down for 45 seconds on 15 August 2026. After any change under `lib/`, watch the first boot:
 

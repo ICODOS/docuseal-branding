@@ -863,6 +863,13 @@ module McpOauth
           static_user = super
 
           if static_user
+            # Logged so that a static token can be retired on evidence. DocuSeal
+            # stores no last-used time for these tokens, and before this line
+            # nothing anywhere recorded whether one was still in use: the only
+            # way to find out was to revoke it and wait for something to break.
+            # OAuth calls are logged by McpOauth.authenticate_request.
+            Rails.logger.info("[mcp-oauth] /mcp authorized by STATIC token user_id=#{static_user.id}")
+
             static_user
           else
             principal = McpOauth.authenticate_request(request)

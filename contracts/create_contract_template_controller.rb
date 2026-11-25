@@ -190,6 +190,10 @@ module Mcp
 
       submitters = roles.map { |role| { 'name' => role, 'uuid' => SecureRandom.uuid } }
 
+      # Before the download and before anything is saved, so a refusal costs
+      # nothing and leaves nothing behind.
+      ensure_every_role_signs!(Array.wrap(mcp_params['fields']), submitters)
+
       # Waits out OneDrive sync rather than failing on a 404 the caller would
       # have to interpret. See IcodosGraph#download_when_synced.
       bytes = IcodosGraph.download_when_synced(source_path)
@@ -227,8 +231,15 @@ module Mcp
         'icodos_source_path' => source_path
       )
 
+      # FilenameUtils.basename(blob[:filename]) is how upstream names documents
+      # since 3.3.6, at every site that used to call filename.base. Kept in step
+      # so a document reads the same whichever path created it.
+      schema = documents.map do |doc|
+        { 'attachment_uuid' => doc.uuid, 'name' => FilenameUtils.basename(doc.blob[:filename]) }
+      end
+
       @template.update!(
-        schema: documents.map { |doc| { 'attachment_uuid' => doc.uuid, 'name' => doc.filename.base } },
+        schema: schema,
         fields: fields,
         folder: folder_name.present? ? TemplateFolders.find_or_create_by_name(current_user, folder_name) : @template.folder,
         preferences: preferences
@@ -286,6 +297,34 @@ module Mcp
     ensure
       tempfile&.close
       tempfile&.unlink
+    end
+
+    # Every role must own a signature field.
+    #
+    # Upstream turns a role that owns no field into a viewer and invites the
+    # next role at once. With roles ["Employer", "Employee"] and every field
+    # assigned to "Employee", the employer never signs: the employee is invited
+    # immediately, signs alone, and the document completes and is filed as
+    # signed. The first-signer domain guard in icodos_send_contract checked the
+    # employer's address and was satisfied, because it looks at the first ROLE,
+    # not at who upstream actually sends to first. Requiring a signature per
+    # role closes that from this side; the send tool refuses such a template
+    # from the other, for templates made before 25 November 2026 or edited by
+    # hand. All 97 templates this tool had created by then already comply.
+    def ensure_every_role_signs!(raw_fields, submitters)
+      signing = raw_fields.each_with_index.map do |raw, index|
+        next unless raw.is_a?(Hash) && raw['type'].to_s.strip.downcase == 'signature'
+
+        resolve_submitter_uuid!(raw, submitters, "field #{index + 1}")
+      end
+
+      missing = submitters.reject { |s| signing.include?(s['uuid']) }.map { |s| s['name'] }
+
+      return if missing.empty?
+
+      raise InvalidArguments,
+            "every role must sign: there is no signature field for #{missing.join(', ')}. A role without one " \
+            'would be treated as a viewer and skipped, and the next role would be invited straight away.'
     end
 
     def build_fields!(raw_fields, submitters, attachment_uuid)

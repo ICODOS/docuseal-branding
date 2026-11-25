@@ -77,7 +77,8 @@ module Mcp
           },
           confirm: {
             type: 'boolean',
-            description: 'Must be true to actually send. Anything else returns a preview and sends nothing.'
+            description: 'Must be the boolean true to actually send. Anything else, the string "true" included, ' \
+                         'returns a preview and sends nothing.'
           }
         },
         required: %w[template_id submitters]
@@ -122,6 +123,11 @@ module Mcp
       raise InvalidArguments, 'template has been archived' if @template.archived_at?
       raise InvalidArguments, 'template has no fields — nothing to sign' if @template.fields.blank?
 
+      # Same refusal as upstream send_documents since 3.4.0.
+      raise InvalidArguments, 'templates with variables are not supported' if @template.variables_schema.present?
+
+      ensure_first_role_signs!
+
       authorize!(:create, Submission.new(template: @template, account_id: current_user.account_id))
 
       ordered = match_submitters!(Array.wrap(mcp_params['submitters']))
@@ -130,7 +136,12 @@ module Mcp
       expire_at = parse_expire_at!(mcp_params['expire_at'])
 
       # Preview path — no side effects whatsoever.
-      unless ActiveModel::Type::Boolean.new.cast(mcp_params['confirm'])
+      #
+      # Exactly the JSON boolean true sends. This used to be a Rails boolean
+      # cast, which treats everything outside a short list of false values as
+      # true: "False", "no", "preview", "null" and 2 all sent the contract,
+      # while the schema promised that anything but true only previews.
+      unless mcp_params['confirm'] == true
         return render_tool_result(
           sent: false,
           preview: true,
@@ -256,6 +267,30 @@ module Mcp
       enforce_first_signer_domain!(ordered.first)
 
       ordered
+    end
+
+    # The first-signer domain guard below constrains the address of the FIRST
+    # ROLE. Upstream decides who actually signs first differently: a role that
+    # owns no field becomes a viewer (Submissions::CreateFromSubmitters), and
+    # the first invitation goes to the first role that is NOT a viewer
+    # (Submissions.send_signature_requests). So a template whose fields all
+    # belong to the second role passed the domain guard on role one and then
+    # invited role two straight away, who could sign alone and have the result
+    # filed as "(signed)". The guard only means something if the role it checks
+    # is a role that signs.
+    def ensure_first_role_signs!
+      first = @template.submitters.first.to_h
+
+      signs = @template.fields.any? do |field|
+        field['submitter_uuid'] == first['uuid'] && field['type'] == 'signature'
+      end
+
+      return if signs
+
+      raise InvalidArguments,
+            "the first signing role (#{first['name'].inspect}) has no signature field on this template, so it " \
+            'would not sign at all and the next role would be invited immediately. Recreate the template with ' \
+            'a signature field for every role.'
     end
 
     def enforce_first_signer_domain!(first)

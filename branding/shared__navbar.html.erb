@@ -12,9 +12,19 @@
   the dropdown; the class is no longer in the Tailwind content set, so a stale
   copy of the 3.1.6 markup silently loses the menu width.
 
+  ONE UPSTREAM LINE IS LEFT OUT ON PURPOSE. Since 3.3.6 upstream renders
+  shared/mobile_app_alert here for signed-in users on iOS and Android: a yellow
+  bar advertising the DocuSeal app with links to the app stores. The native
+  apps sign in through the password JSON route, which SSO enforcement blocks,
+  so on this instance the banner would send staff to an app that cannot sign
+  them in. If that ever changes, the upstream line is
+    render 'shared/mobile_app_alert' if signed_in? && cookies[:mobile_app_alert].blank? && (browser_os == 'ios' || browser_os == 'android')
+  and it needs 3.3.6 or later: neither the partial nor browser_os exists before.
+
   CHECK THIS FILE ON EVERY DOCUSEAL VERSION BUMP — a stale override renders an
   old layout without any error.
-  Rebased on upstream 3.3.4.
+  Rebased on upstream 3.4.0. Apart from the line above, upstream's file is
+  unchanged since 3.3.4.
 %>
 <% if signed_in? %>
   <%= render 'shared/navbar_warning' %>

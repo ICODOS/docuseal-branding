@@ -4,7 +4,7 @@ Branding overlay for our self-hosted [DocuSeal](https://github.com/docusealco/do
 
 **For everyday admin tasks — adding staff, rotating the Entra client secret, break-glass, running the MCP OAuth connector — see [`20260807-DocuSeal-Entra admin runbook-v1.md`](./20260807-DocuSeal-Entra%20admin%20runbook-v1.md).** This README documents *what's in the overlay* and *how to deploy it*; the runbook covers the recurring operations.
 
-**For a DocuSeal version bump, see [`20261101-DocuSeal-Version bump 3.3.4 runbook-v1.md`](./20261101-DocuSeal-Version%20bump%203.3.4%20runbook-v1.md).** It covers the 3.1.6 to 3.3.4 bump specifically, and the shape of it carries over to the next one.
+**For a DocuSeal version bump, see [`20261101-DocuSeal-Version bump 3.3.4 runbook-v1.md`](./20261101-DocuSeal-Version%20bump%203.3.4%20runbook-v1.md).** It covers the 3.1.6 to 3.3.4 bump specifically, and the shape of it carries over to the next one. [`20261125-DocuSeal-Version bump 3.4.0 runbook-v1.md`](./20261125-DocuSeal-Version%20bump%203.4.0%20runbook-v1.md) records the 3.3.4 to 3.4.0 bump and what was tested before it.
 
 ## What is changed
 
@@ -33,7 +33,7 @@ Branding overlay for our self-hosted [DocuSeal](https://github.com/docusealco/do
 | `deploy.sh` | Refreshes **every** overlay directory on the server, dumps the database first, refuses to start if a bind-mount source is missing, and proves the running container sees the new files |
 | `docker-compose.yml` | Stock compose file plus the overlay mounts, SSO + MCP OAuth env vars, and a pinned image version |
 
-Everything else — application code, database, TLS, email templates — is the unmodified official image `docuseal/docuseal` (pinned, currently `3.3.4`). Email wording, policy links, and the completion message are configured in the app's own Personalization settings, not in this repo.
+Everything else — application code, database, TLS, email templates — is the unmodified official image `docuseal/docuseal` (currently `3.4.0`, pinned by tag and by digest, as are `postgres` and `caddy`). Email wording, policy links, and the completion message are configured in the app's own Personalization settings, not in this repo.
 
 ## License compliance (AGPL-3.0)
 
@@ -66,8 +66,25 @@ Staff sign in via Microsoft Entra ID (Azure AD). The community DocuSeal image do
 | `ENTRA_CLIENT_SECRET` | App registration client secret — sensitive; do not commit or log |
 | `SSO_ENFORCE` | `true` blocks all password sign-in and password-reset routes. Default `false`. |
 | `SSO_BREAK_GLASS` | `true` re-enables password login even when `SSO_ENFORCE=true`. Default `false`. |
+| `SESSION_REMEMBER_DAYS` | How long a browser stays signed in without a new Microsoft sign-in. Set to `30` in `docker-compose.yml`; upstream's default is 730. |
 
 Redirect URI to register in the Azure portal: `https://sign.icodos.com/auth/entra/callback`
+
+### What enforcement actually blocks
+
+With `SSO_ENFORCE=true`, and unless break-glass is on, three things hold. The boot log states the result in one line:
+
+```
+[sso] configured=true enforce=true break_glass=false password_login=blocked password_strategy=off
+```
+
+1. **No password is ever compared.** Devise asks the `User` model, per request, whether a strategy may authenticate from request parameters. The overlay answers no. There is no session, no remember cookie and no failed-attempt count from a posted password, on any route.
+2. **The sign-in, password and invitation routes refuse.** `/sign_in`, `/password` and `/invitation` redirect to Microsoft on GET and answer 403 otherwise.
+3. **Sessions last 30 days**, not upstream's 730 (`SESSION_REMEMBER_DAYS`).
+
+Until 25 November 2026 only the second point existed, and only for the first two routes, and it did not do what it said. The refusal was a `before_action` that ran last. Before it, `ApplicationController` had already called `current_user`, which on `POST /sign_in` makes Warden check the posted password; on a match the session and a two-year remember cookie were set, and the 403 that followed carried them. A wrong password on the same path counted towards Devise's lockout, so 15 anonymous requests locked a known address out of Microsoft sign-in for 23 hours. `/invitation` is served by a sibling of `PasswordsController` and was never patched: it accepted a reset token, set a password and signed the user in. All three were reproduced on a scratch copy before the fix and shown closed after it; the bump runbook has the table.
+
+`SSO_ENFORCE` and `SSO_BREAK_GLASS` are read case-insensitively and trimmed. They used to be compared with `== 'true'`, so `True` or a stray space switched enforcement off without a word.
 
 ### Break-glass procedure
 
@@ -80,7 +97,7 @@ cd /opt/docuseal
 docker compose up -d
 ```
 
-Within ~5 seconds password login is available again. Fix Entra, then flip `SSO_BREAK_GLASS` back to `false` and `docker compose up -d` once more.
+Within ~5 seconds password login is available again; the boot line then reads `password_login=ALLOWED password_strategy=ON`. This was tested together with the enforcement fix, because a block that break-glass cannot lift would be worse than the gap it closed. Fix Entra, then flip `SSO_BREAK_GLASS` back to `false` and `docker compose up -d` once more.
 
 A misconfigured SSO (any of `ENTRA_TENANT_ID` / `ENTRA_CLIENT_ID` / `ENTRA_CLIENT_SECRET` missing) is treated as an implicit break-glass — password login stays enabled and a warning is logged at boot. This is deliberate: a bad config must never lock admins out of their own instance.
 
@@ -286,7 +303,19 @@ Same overlay pattern as Phase D: bind-mounted files, no image rebuild, no new ge
 | `icodos_create_contract_template` | Reads a PDF from the SharePoint contracts folder, creates a template with fields placed, roles assigned, folder set, and the filing destination recorded |
 | `icodos_send_contract` | Sends for signature with `submitters_order: 'preserved'`. Returns a **preview** and sends nothing unless `confirm` is true |
 
-Both inherit `Mcp::McpBaseController`, so authentication, the archived-user check and the Phase D OAuth hook apply exactly as they do to the five upstream tools. Archiving a DocuSeal user still revokes access.
+Both inherit `Mcp::McpBaseController`, so authentication, the archived-user check and the Phase D OAuth hook apply exactly as they do to the upstream tools. Archiving a DocuSeal user still revokes access.
+
+### Which tools an agent is offered
+
+| Tool | Offered |
+|---|---|
+| `search_templates`, `load_template`, `search_documents` | yes, read only, upstream |
+| `icodos_create_contract_template`, `icodos_send_contract` | yes |
+| `send_documents`, `create_template` | **no**, hidden since 25 November 2026 |
+
+The two hidden tools are upstream's. They sat next to the guarded ICODOS tools with none of the guards: any template to any recipient with random signing order, and a server-side fetch of any `https` address. The guards therefore protected only an agent that chose the guarded tool, and an instruction smuggled into a document gives an agent no reason to. A hidden tool is absent from `tools/list`; a client that still calls it from an older list gets a tool error naming what to use instead.
+
+`ICODOS_MCP_HIDDEN_TOOLS` controls this: unset hides these two, a comma-separated list hides exactly that list, `none` offers everything upstream ships. It is independent of `ICODOS_CONTRACTS_ENABLED` on purpose. A lapsed Graph certificate switches the contract tools off, and that must not be what puts the unguarded tools back.
 
 ### Why not the upstream tools
 
@@ -335,7 +364,8 @@ ruby contracts/selftest.rb
 
 ### Other deliberate constraints
 
-- **Sending is a separate tool from preparing**, so a contract can never be sent as a side effect of building one, and `confirm` must be true or the tool only previews.
+- **Sending is a separate tool from preparing**, so a contract can never be sent as a side effect of building one, and `confirm` must be the JSON boolean `true` or the tool only previews. It used to be a Rails boolean cast, under which `"False"`, `"no"` and `2` all sent.
+- **Every role must own a signature field.** Upstream turns a role without fields into a viewer and invites the next role at once, so a template whose fields all belonged to the employee passed the first-signer check on the employer's address and then went straight to the employee. The create tool refuses such a field list before reading the file; the send tool refuses a template whose first role does not sign.
 - **The first signer must be at a configured domain** (`ICODOS_CONTRACTS_FIRST_SIGNER_DOMAINS`, default `icodos.com,icodos.de`). The first signer countersigns for ICODOS; without this, an instruction smuggled into a document could send a fabricated contract with both roles pointed at addresses an attacker controls.
 - **Filing never overwrites.** A name collision files alongside with a numeric suffix and logs a warning, because silently replacing an executed employment contract is not an acceptable failure mode.
 - **Filing is idempotent.** The filed path is recorded on the submission; DocuSeal retries any non-2xx up to ten times, and a transient failure after a successful upload must not duplicate a contract.
@@ -369,6 +399,7 @@ Deliveries are recorded as `WebhookEvent`s and visible in the DocuSeal UI, so fa
 | `ICODOS_GRAPH_SITE_PATH` | e.g. `/sites/<site>` |
 | `ICODOS_CONTRACTS_PATH_PREFIX` | The only subtree these tools may touch |
 | `ICODOS_CONTRACTS_FIRST_SIGNER_DOMAINS` | Optional; defaults to `icodos.com,icodos.de` |
+| `ICODOS_MCP_HIDDEN_TOOLS` | Optional; unset hides `send_documents` and `create_template`. `none` hides nothing |
 
 ### The credential
 
@@ -600,4 +631,4 @@ The image is version-pinned, so updates are deliberate:
    - Tab title reads "ICODOS – Document Signing".
 4. After a version bump, also confirm the MCP endpoint still responds (it is a recent DocuSeal feature), and run the Phase D smoke check in the admin runbook, section 7. Run the reveal and reminder checks as well; both are one `rails runner` line and both are listed in their own sections above.
 
-Note: the server's weekly cron (`docker compose pull`) is a no-op for the pinned app image; version bumps are manual by design. A monthly automated check compares the pinned version against the latest DocuSeal release.
+Note: nothing on the server pulls images on a schedule and nothing checks for new releases. An earlier version of this note claimed a weekly pull and a monthly check; neither existed, and the proxy and database images, then on floating tags, went four and five months without an update. All three images are now pinned by tag and digest, so nothing changes until `docker-compose.yml` does. Upstream releases roughly weekly: https://github.com/docusealco/docuseal/releases

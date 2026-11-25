@@ -1,8 +1,11 @@
 # ICODOS-branded DocuSeal stack — sign.icodos.com
 # Based on the original /opt/docuseal/docker-compose.yml, with:
 #   1. Image pinned to a tested version (no surprise updates that could break the view overrides)
-#      Currently 3.3.4. The view overrides below are rebased on that tag; see
+#      Currently 3.4.0. The view overrides below are rebased on that tag; see
 #      "Deploying / updating on the server" in README.md before changing it.
+#      All three images are pinned by digest as well as by tag. A tag can be
+#      pushed again with different content; a digest cannot. The tag is there
+#      for the reader, the digest is what Docker pulls.
 #      Nothing here is scanned by Tailwind at image build time, so a class that
 #      upstream stopped using is purged from the CSS and silently does nothing.
 #   2. Branding overlay files mounted over the stock views (see ./branding)
@@ -18,7 +21,7 @@
 
 services:
   app:
-    image: docuseal/docuseal:3.3.4
+    image: docuseal/docuseal:3.4.0@sha256:b664cc84014f607f090140973f2e082cc551954d42f6f17e07fdd54dee6fdc08
     restart: unless-stopped
     depends_on:
       postgres:
@@ -108,6 +111,14 @@ services:
       - ENTRA_CLIENT_SECRET=${ENTRA_CLIENT_SECRET:-}
       - SSO_ENFORCE=${SSO_ENFORCE:-false}
       - SSO_BREAK_GLASS=${SSO_BREAK_GLASS:-false}
+      # How long a browser stays signed in without a new Microsoft sign-in.
+      # Upstream's default is 730 days, and every SSO sign-in sets the cookie
+      # (User#remember_me is always true). A stolen cookie was therefore good
+      # for two years and untouched by anything done in Entra: password reset,
+      # session revocation, conditional access. Devise checks the age on the
+      # server, so lowering this also ends cookies already issued that are
+      # older than the new limit.
+      - SESSION_REMEMBER_DAYS=${SESSION_REMEMBER_DAYS:-30}
       # Phase D — MCP OAuth 2.1. Off unless MCP_OAUTH_ENABLED=true.
       - MCP_OAUTH_ENABLED=${MCP_OAUTH_ENABLED:-false}
       - MCP_OAUTH_SIGNING_KEY_PATH=${MCP_OAUTH_SIGNING_KEY_PATH:-/app/config/icodos/mcp_oauth_signing_key.pem}
@@ -130,6 +141,12 @@ services:
       # to. Defaults to icodos.com,icodos.de when unset — see the constant in
       # send_contract_controller.rb for why this guard exists.
       - ICODOS_CONTRACTS_FIRST_SIGNER_DOMAINS=${ICODOS_CONTRACTS_FIRST_SIGNER_DOMAINS:-}
+      # Upstream MCP tools not offered to agents on this instance, because they
+      # carry none of the guards of the two ICODOS tools. See the constant
+      # DEFAULT_HIDDEN_TOOLS in contracts/zz_icodos_contracts.rb. Deliberately
+      # `-` and not `:-`: only an UNSET variable takes the default. To offer
+      # every upstream tool again, set ICODOS_MCP_HIDDEN_TOOLS=none in .env.
+      - ICODOS_MCP_HIDDEN_TOOLS=${ICODOS_MCP_HIDDEN_TOOLS-send_documents,create_template}
       # SSO API key reveal. Off unless explicitly true; when off the upstream
       # password dialog is served unchanged.
       - ICODOS_SSO_REVEAL_ENABLED=${ICODOS_SSO_REVEAL_ENABLED:-false}
@@ -139,7 +156,11 @@ services:
       - ICODOS_REMINDERS_DRY_RUN=${ICODOS_REMINDERS_DRY_RUN:-true}
 
   postgres:
-    image: postgres:16
+    # Was the floating tag postgres:16, which nothing ever pulled again: the
+    # server ran 16.14 for four months while 16.16 was out. Bump tag and digest
+    # together, deliberately, like the app image. Minor releases of one major
+    # version share the data directory format, so no dump and restore.
+    image: postgres:16.16@sha256:07abc3f43c9395b0bdbbab36bc25ddb0e8d83cd4fcafb5fb7d6abe14ff156dd8
     restart: unless-stopped
     volumes:
       - pg_data:/var/lib/postgresql/data
@@ -154,7 +175,8 @@ services:
       retries: 10
 
   caddy:
-    image: caddy:2
+    # Pinned for the same reason as postgres; was caddy:2, running 2.11.4.
+    image: caddy:2.11.9@sha256:4851e54a46b206517c574821bb5cc67f170d2156041e9fbc4c9193b45e84a75b
     restart: unless-stopped
     ports:
       - "80:80"

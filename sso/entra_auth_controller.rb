@@ -33,7 +33,12 @@ module Sso
                            alert: 'Microsoft sign-in is not configured on this server.'
       end
 
-      reveal = params[:purpose].to_s == IcodosReveal::PURPOSE
+      reveal = reveal_requested?
+
+      # A reveal intent left over from an abandoned attempt would otherwise turn
+      # the NEXT ordinary sign-in within its lifetime into a reveal, and nobody
+      # would be signed in.
+      session.delete(SESSION_REVEAL_KEY) unless reveal
 
       if reveal
         # Everything here fails closed and sends the user back to the settings
@@ -160,6 +165,17 @@ module Sso
     end
 
     private
+
+    # IcodosReveal lives in its own mount block in docker-compose.yml, and the
+    # compose file says that deleting the block removes the feature. A bare
+    # IcodosReveal::PURPOSE in `start` contradicted that: with the block gone it
+    # raised NameError on EVERY /auth/entra, and under SSO_ENFORCE that is a
+    # lockout for everyone until break-glass. No module means no reveal.
+    def reveal_requested?
+      params[:purpose].to_s == IcodosReveal::PURPOSE
+    rescue NameError
+      false
+    end
 
     def fail_login(message)
       return redirect_to(settings_api_index_path, alert: message) if @icodos_reveal_flow

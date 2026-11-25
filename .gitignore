@@ -6,3 +6,8 @@ secrets/
 *.key
 
 .DS_Store
+
+# Environment files hold the database password and the Entra client secret.
+# They live only on the server.
+.env
+.env.*

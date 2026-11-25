@@ -2,12 +2,26 @@
 #
 # Refresh the ICODOS DocuSeal overlay on the server and restart the stack.
 #
-# Run it from /opt/docuseal on sign.icodos.com:
-#   curl -fsSL https://raw.githubusercontent.com/ICODOS/docuseal-branding/main/deploy.sh | bash
-# or, if the repo is already checked out somewhere, just run this file.
+# Run it from /opt/docuseal on sign.icodos.com, naming the exact commit:
+#   SHA=<full 40-character commit id>
+#   curl -fsSL "https://raw.githubusercontent.com/ICODOS/docuseal-branding/$SHA/deploy.sh" | DEPLOY_SHA="$SHA" bash
+# or, if the repo is already checked out somewhere, run this file with
+# DEPLOY_SHA set.
+#
+# WHY A COMMIT ID AND NOT A BRANCH
+# This script runs as root and what it installs is mounted into the app, so
+# whoever decides which code it fetches decides what runs on the server. A
+# branch name is a pointer that anyone with push access can move, between the
+# moment a change was read and the moment it is deployed. A commit id cannot be
+# moved: it names one tree, the one that was reviewed. The same goes for the
+# URL above. Fetched from a branch it would be whatever the branch holds at
+# that second; fetched from a commit id it is the file as reviewed.
+# The deployed id is written to .deployed_sha, so "what is running" has an
+# answer that does not depend on memory.
 #
 # What it does, in order:
-#   1. refuses to run outside a directory that has .env and secrets/
+#   1. refuses to run without DEPLOY_SHA, or outside a directory that has .env
+#      and secrets/
 #   2. dumps the database, because DocuSeal runs migrations on boot and they
 #      are not reversed by putting the old image tag back
 #   3. copies EVERY overlay directory, not just branding/
@@ -17,11 +31,11 @@
 #   5. brings the stack up, recreating the app container even when only overlay
 #      files changed, and prints the boot diagnostics
 #   6. proves the running container sees the overlay files just copied, by
-#      comparing checksums on the host and inside the container
+#      comparing checksums on the host and inside the container, and only then
+#      records the commit id in .deployed_sha
 #
-# Escape hatches:
+# Escape hatch:
 #   SKIP_DB_BACKUP=1   skip step 2
-#   REPO_REF=some-branch   deploy something other than main
 #
 # WHY EVERYTHING RUNS INSIDE main()
 # Piped into bash, as above, the script IS bash's stdin, and bash reads it one
@@ -46,7 +60,7 @@
 set -euo pipefail
 
 REPO_URL="https://github.com/ICODOS/docuseal-branding.git"
-REPO_REF="${REPO_REF:-main}"
+DEPLOY_SHA="${DEPLOY_SHA:-}"
 OVERLAY_DIRS=(branding sso mcp contracts reveal reminders)
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/docuseal}"
 
@@ -101,7 +115,15 @@ verify_overlay_live() {
 }
 
 main() {
-  # --- 1. where are we -------------------------------------------------------
+  # --- 1. what, and where ----------------------------------------------------
+  case "$DEPLOY_SHA" in
+    "") die "DEPLOY_SHA is not set. Name the commit to deploy, in full:
+       git ls-remote $REPO_URL main
+       prints the current one. Read what it contains before deploying it." ;;
+  esac
+  printf '%s' "$DEPLOY_SHA" | grep -qE '^[0-9a-f]{40}$' \
+    || die "DEPLOY_SHA must be a full 40-character commit id, not a branch, a tag or a short id. Got: $DEPLOY_SHA"
+
   [ -f .env ] || die "no .env in $(pwd). Run this from /opt/docuseal."
   [ -d secrets ] || die "no secrets/ in $(pwd). Run this from /opt/docuseal."
   command -v docker >/dev/null || die "docker is not on PATH."
@@ -110,10 +132,15 @@ main() {
   if [ "${SKIP_DB_BACKUP:-0}" = "1" ]; then
     say "skipping the database dump (SKIP_DB_BACKUP=1)."
   else
+    # The dump holds names, private addresses and password hashes, so it is
+    # written for root alone. The umask is set in a subshell on purpose: set
+    # for the whole script it would also apply to the overlay files copied in
+    # step 3, and the app, which runs as uid 2000, could no longer read them.
     mkdir -p "$BACKUP_DIR"
+    chmod 700 "$BACKUP_DIR"
     dump="$BACKUP_DIR/docuseal-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
     say "dumping the database to $dump"
-    docker compose exec -T postgres pg_dump -U postgres docuseal </dev/null | gzip > "$dump" \
+    ( umask 077; docker compose exec -T postgres pg_dump -U postgres docuseal </dev/null | gzip > "$dump" ) \
       || die "pg_dump failed. Migrations run on boot and are not reversible; fix this before deploying."
     [ -s "$dump" ] || die "the dump is empty: $dump"
     say "dump is $(du -h "$dump" | cut -f1)."
@@ -123,12 +150,22 @@ main() {
   # Global, not local: the EXIT trap runs after main has returned.
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
-  say "cloning $REPO_URL ($REPO_REF)"
-  git clone --quiet --depth 1 --branch "$REPO_REF" "$REPO_URL" "$tmp/repo" </dev/null \
-    || die "clone failed."
+  # Fetched by id, not cloned by branch: `git clone --branch` cannot take a
+  # commit id, and a branch is exactly what this must not depend on.
+  say "fetching $REPO_URL at $DEPLOY_SHA"
+  git init --quiet "$tmp/repo" </dev/null || die "git init failed."
+  git -C "$tmp/repo" remote add origin "$REPO_URL" </dev/null || die "git remote add failed."
+  git -C "$tmp/repo" fetch --quiet --depth 1 origin "$DEPLOY_SHA" </dev/null \
+    || die "could not fetch $DEPLOY_SHA. Is it a commit in $REPO_URL, and pushed?"
+  git -C "$tmp/repo" -c advice.detachedHead=false checkout --quiet FETCH_HEAD </dev/null \
+    || die "checkout failed."
+
+  got="$(git -C "$tmp/repo" rev-parse HEAD </dev/null)"
+  [ "$got" = "$DEPLOY_SHA" ] \
+    || die "asked for $DEPLOY_SHA but the checkout is $got. Nothing was changed."
 
   for d in "${OVERLAY_DIRS[@]}"; do
-    [ -d "$tmp/repo/$d" ] || die "the repo has no $d/ directory. Check REPO_REF."
+    [ -d "$tmp/repo/$d" ] || die "commit $DEPLOY_SHA has no $d/ directory."
   done
 
   for d in "${OVERLAY_DIRS[@]}"; do
@@ -180,6 +217,11 @@ main() {
 
   # --- 6. prove it ----------------------------------------------------------
   verify_overlay_live
+
+  # Written last, so the file never names a commit that is not the one running.
+  [ -f .deployed_sha ] && cp .deployed_sha .deployed_sha.prev
+  printf '%s\n' "$DEPLOY_SHA" > .deployed_sha
+  say "recorded $DEPLOY_SHA in .deployed_sha"
 
   say "done. Now run the acceptance checks in the version bump runbook."
 }

@@ -70,7 +70,7 @@ cd /opt/docuseal && ls -la secrets/
 ## 3. Deploy
 
 ```bash
-cd /opt/docuseal && curl -fsSL https://raw.githubusercontent.com/ICODOS/docuseal-branding/main/deploy.sh | bash
+cd /opt/docuseal && SHA=<the 40-character commit id> && curl -fsSL "https://raw.githubusercontent.com/ICODOS/docuseal-branding/$SHA/deploy.sh" | DEPLOY_SHA="$SHA" bash
 ```
 
 The script dumps the database to `/var/backups/docuseal`, refreshes all six overlay directories and `docker-compose.yml`, checks that all 39 bind-mount sources exist and are files, brings the stack up, and prints the ICODOS boot diagnostics. It stops before touching the stack if any check fails.

@@ -90,17 +90,19 @@ The SSO layer is our own code, distributed under the same public repository. Doc
 
 ## Deploying / updating on the server
 
-```bash
-cd /opt/docuseal && curl -fsSL https://raw.githubusercontent.com/ICODOS/docuseal-branding/main/deploy.sh | bash
-```
-
-To read the script before running it, which is the better habit:
+A deploy names the exact commit it installs. Take the id of the commit you have read, in full:
 
 ```bash
-cd /opt/docuseal && git clone --depth 1 https://github.com/ICODOS/docuseal-branding.git /tmp/overlay && less /tmp/overlay/deploy.sh && bash /tmp/overlay/deploy.sh
+git ls-remote https://github.com/ICODOS/docuseal-branding.git main
 ```
 
-`deploy.sh` is the whole procedure. It refuses to run outside a directory holding `.env` and `secrets/`, dumps the database to `/var/backups/docuseal`, refreshes **all six** overlay directories, checks every bind-mount source, then brings the stack up and prints the ICODOS boot diagnostics. `SKIP_DB_BACKUP=1` and `REPO_REF=<branch>` are the only knobs.
+```bash
+cd /opt/docuseal && SHA=<the 40-character id> && curl -fsSL "https://raw.githubusercontent.com/ICODOS/docuseal-branding/$SHA/deploy.sh" | DEPLOY_SHA="$SHA" bash
+```
+
+**Why a commit id and not `main`.** The script runs as root, and what it installs is mounted into the app. A branch is a pointer that anyone with push access can move between the moment a change was read and the moment it is deployed; a commit id names one tree and cannot be moved. That holds for the URL as well: fetched from a branch it is whatever the branch holds at that second, fetched from a commit id it is the file as reviewed. `deploy.sh` refuses to run without `DEPLOY_SHA`, refuses anything that is not a full id, checks after fetching that it got that commit, and writes the id to `/opt/docuseal/.deployed_sha` once the new code is proven live. `cat /opt/docuseal/.deployed_sha` answers "what is running".
+
+`deploy.sh` is the whole procedure. It refuses to run outside a directory holding `.env` and `secrets/`, dumps the database to `/var/backups/docuseal` (readable by root only), refreshes **all six** overlay directories, checks every bind-mount source, then brings the stack up and prints the ICODOS boot diagnostics. `SKIP_DB_BACKUP=1` is the only knob.
 
 Two things it does that a hand-run deploy tends to get wrong, both found on 20 November 2026:
 

@@ -74,6 +74,15 @@ services:
       - ./secrets/graph_filing_key.pem:/app/config/icodos/graph_filing_key.pem:ro
       - ./secrets/graph_filing_cert.pem:/app/config/icodos/graph_filing_cert.pem:ro
       # --- end Phase E ---
+      # --- Timestamp guard (independent of Phase E; lives in contracts/ so deploy.sh copies it) ---
+      # With a timestamp server set, upstream embeds a bare time value in place
+      # of the token when the server fails, and never asks the fallback after a
+      # network error. This tries every configured server, verifies the token,
+      # and otherwise signs without one and records the failure for the health
+      # job. Inert while no timestamp server is set. Removing the line puts
+      # upstream's behaviour back.
+      - ./contracts/zz_icodos_timestamp.rb:/app/config/initializers/zz_icodos_timestamp.rb:ro
+      # --- end Timestamp guard ---
       # --- SSO API key reveal (delete this whole block to remove the code) ---
       # Lets SSO-provisioned users reveal their API key by re-authenticating
       # with Microsoft. They have no password to type: SSO provisioning sets a

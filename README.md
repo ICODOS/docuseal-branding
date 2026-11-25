@@ -28,6 +28,7 @@ Branding overlay for our self-hosted [DocuSeal](https://github.com/docusealco/do
 | `mcp/oauth_consent.html.erb` | Phase D — the consent page (self-contained, no app layout) |
 | `mcp/zz_mcp_oauth.rb` | Phase D — initializer: routes, log filtering, boot diagnostics, the `/mcp` hook |
 | `contracts/*` | Phase E — SharePoint contract filing: the two ICODOS MCP tools, the `/icodos/hooks/filing` hook, the Graph client and its checks |
+| `contracts/zz_icodos_timestamp.rb` | Timestamp guard: with a timestamp server set, every configured server is tried, a token is verified before it is embedded, and a document is never signed with a broken timestamp (see below) |
 | `reveal/*` | SSO API key reveal: re-authenticate with Microsoft instead of typing a password nobody has |
 | `reminders/*` | Signature reminders, which DocuSeal ships only in Pro: scheduler, sweep, mailer, settings page |
 | `deploy.sh` | Refreshes **every** overlay directory on the server, dumps the database first, refuses to start if a bind-mount source is missing, and proves the running container sees the new files |
@@ -593,6 +594,17 @@ docker compose exec -T -w /app app rails runner 'require "icodos_reminder_check"
 ### AGPL note
 
 Part of the modified source published for AGPL-3.0 compliance. DocuSeal attribution in the interactive UI is untouched.
+
+## Timestamp guard
+
+A timestamp server is set under Settings → E-Signature → Timestamp Server. DocuSeal then asks it for an RFC 3161 token over each signature and embeds the token in the signature, so a PDF viewer can show the signing time as proven by a third party instead of asserted by this server's clock. The server receives a SHA-256 digest of the signature value and nothing else. A fallback can follow after a comma: `http://timestamp.digicert.com,http://timestamp.sectigo.com`. Upstream's settings form tests the whole value as one address and refuses that, although the signing code reads it; save it from a Rails console instead, after testing each part.
+
+`contracts/zz_icodos_timestamp.rb` replaces two things upstream does when the server fails, both reproduced on a scratch copy of the stack on 25 November 2026:
+
+- **A failure was written into the document.** Upstream's handler rescues every error and returns a bare time value, which is then embedded where the token belongs. A timeout or a refused connection produced a signed PDF whose timestamp attribute cannot be decoded. HexaPDF's own verifier raised on it. That reads as a broken signature, which is worse than none, and nothing was logged as a failure.
+- **The fallback covered only an HTTP error status.** After a network error on the first server the second was never asked.
+
+The guard asks each configured server in turn, on any failure. A response is used only if it is a granted token over exactly this signature, carries the nonce that was sent, and is signed by a time-stamping certificate the system trust store accepts. If no server gives one, the signature is made without a timestamp, as before a server was configured, the error is logged as `[icodos-timestamp] FAILED`, and the time and reason go to `/data/docuseal/icodos_timestamp_failure.json` for whatever watches the host. The boot log says `[icodos-timestamp] guard attached`, or `NOT attached` if an upstream change moved either seam (`Submissions::TimestampHandler#sign`, HexaPDF's `SignedDataCreator#create_unsigned_attrs`), which `deploy.sh` treats as a failed boot. Without a timestamp server the guard does nothing.
 
 ## Updating DocuSeal itself
 

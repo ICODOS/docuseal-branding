@@ -462,14 +462,16 @@ Overlay code lives in `/opt/docuseal/reminders` and is published in the branding
 This is the part that will be lost on a host rebuild:
 
 ```bash
-crontab -l | grep -A1 'reminder sweep'
+crontab -l | grep -A3 'reminder sweep'
 ```
 
 It should read:
 
 ```
-*/15 * * * * cd /opt/docuseal && /usr/bin/docker compose exec -T -w /app app rails runner "IcodosReminderSweep.call" >> /var/log/icodos-reminders.log 2>&1
+*/15 * * * * cd /opt/docuseal && /usr/bin/docker compose exec -T -w /app app rails runner "IcodosReminderSweep.call" 2>&1 | grep -v "redis://" >> /var/log/icodos-reminders.log
 ```
+
+The `grep -v "redis://"` is not decoration. Every run boots Rails, and on boot Sidekiq logs the options it connects to Redis with, URL and password included. Appended every 15 minutes, that put the Redis password into this log 8,135 times before it was noticed on 25 November 2026. The log is mode 0600 and rotated weekly by `/etc/logrotate.d/icodos-reminders`; it also holds signer addresses, so keep it that way.
 
 If it is missing, reminders silently stop. The settings page shows a red warning after two hours without a check, and the smoke check fails — but only if someone looks.
 

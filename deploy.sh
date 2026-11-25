@@ -29,13 +29,29 @@
 #      a file; Docker silently creates a DIRECTORY in place of a missing source
 #      and the dependent feature then disables itself with no error anywhere
 #   5. brings the stack up, recreating the app container even when only overlay
-#      files changed, and prints the boot diagnostics
+#      files changed, and waits for the health gate: /up answers inside the
+#      container and through the proxy, and the boot log since the container
+#      started has the line of every feature and no error marker
 #   6. proves the running container sees the overlay files just copied, by
 #      comparing checksums on the host and inside the container, and only then
 #      records the commit id in .deployed_sha
 #
-# Escape hatch:
-#   SKIP_DB_BACKUP=1   skip step 2
+# If step 4, 5 or 6 fails, the overlay and compose file that were in place
+# before are put back and the app is recreated on them, without being asked.
+# The run still ends with exit 1 and .deployed_sha unchanged. Migrations the
+# new version ran are not reversed by that; the dump of step 2 is.
+#
+# Settings, all optional:
+#   SKIP_DB_BACKUP=1      skip step 2
+#   BOOT_TIMEOUT=180      seconds the health gate waits
+#   HEALTH_URL=<url>      /up through the proxy; default https://$HOST/up from
+#                         .env; "none" skips that part
+#   DEPLOY_BOOT_LINES     the expected boot lines, extended regular
+#                         expressions separated by ";"; default: the four
+#                         features this instance runs, see BOOT_LINES below
+#   DEPLOY_REPO_URL       fetch from another copy of the repository, for
+#                         testing this script against a local one; the commit
+#                         id rule applies unchanged
 #
 # WHY EVERYTHING RUNS INSIDE main()
 # Piped into bash, as above, the script IS bash's stdin, and bash reads it one
@@ -56,16 +72,128 @@
 # container is recreated. Rails caches classes in production as well, so
 # nothing would pick the change up without a restart either. Step 6 is the
 # proof that this worked, rather than a log line that suggests it.
+#
+# WHY A HEALTH GATE AND NOT A SLEEP
+# Until 2026-11-25 step 5 slept 45 seconds, printed the boot lines and left
+# reading them to whoever ran it. Every overlay class is eager-loaded, so a
+# renamed upstream base class or a syntax error stops Rails from booting, and
+# the script still went on to step 6, which compares files, not behaviour.
+# The site was then down until someone noticed and deployed the previous id
+# by hand. A feature that disables itself at boot (a missing key, a hook that
+# did not attach) logs one line and leaves the site up, which is worse,
+# because nothing looks wrong. The gate waits for the evidence instead, and
+# rolls back when it does not come.
 
 set -euo pipefail
 
-REPO_URL="https://github.com/ICODOS/docuseal-branding.git"
+REPO_URL="${DEPLOY_REPO_URL:-https://github.com/ICODOS/docuseal-branding.git}"
 DEPLOY_SHA="${DEPLOY_SHA:-}"
 OVERLAY_DIRS=(branding sso mcp contracts reveal reminders)
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/docuseal}"
+BOOT_TIMEOUT="${BOOT_TIMEOUT:-180}"
+# One line per feature, written once at boot by each initializer. "disabled"
+# is a valid state for a feature, but not on this instance: a deploy that
+# turns one off without meaning to must not count as healthy.
+BOOT_LINES="${DEPLOY_BOOT_LINES:-\[sso\] configured=true;\[mcp-oauth\] enabled\.;\[icodos-contracts\] enabled\.;\[icodos-reminders\] enabled,}"
+# Logged by the initializers when a patch did not attach, and by Rails or
+# Zeitwerk when a class cannot be loaded. Any of them ends the wait at once.
+BOOT_ERRORS='NOT attached|could not attach|FATAL|Zeitwerk|NameError|password_strategy=ON'
 
 die() { printf '\n[deploy] FAILED: %s\n' "$1" >&2; exit 1; }
 say() { printf '[deploy] %s\n' "$1"; }
+
+health_url() {
+  local host
+  if [ -n "${HEALTH_URL:-}" ]; then
+    printf '%s' "$HEALTH_URL"
+    return
+  fi
+  host="$(sed -n 's/^HOST=//p' .env | tail -1 | tr -d "\"' \r")"
+  [ -n "$host" ] && printf 'https://%s/up' "$host"
+}
+
+# Step 5. Returns 0 once the app is healthy. On failure it returns 1 with the
+# reason in GATE_REASON. Gives up early when the boot log shows an error
+# marker or the container restarts, because waiting longer cannot help then.
+health_gate() {
+  local deadline=$((SECONDS + BOOT_TIMEOUT)) url cid restarts0="" restarts started log missing p code
+  local pats=()
+  IFS=';' read -ra pats <<< "$BOOT_LINES"
+  url="$(health_url)"
+  GATE_REASON=""
+
+  while :; do
+    GATE_REASON=""
+    cid="$(docker compose ps -q app </dev/null 2>/dev/null || true)"
+    if [ -z "$cid" ]; then
+      GATE_REASON="there is no app container"
+    else
+      restarts="$(docker inspect -f '{{.RestartCount}}' "$cid" 2>/dev/null || echo 0)"
+      [ -n "$restarts0" ] || restarts0="$restarts"
+      if [ "$restarts" != "$restarts0" ]; then
+        GATE_REASON="the app container restarted $((restarts - restarts0)) time(s), so Rails is crashing at boot"
+        return 1
+      fi
+      started="$(docker inspect -f '{{.State.StartedAt}}' "$cid")"
+      log="$(docker compose logs app --no-color --since "$started" </dev/null 2>&1 || true)"
+      if printf '%s\n' "$log" | grep -qE "$BOOT_ERRORS"; then
+        GATE_REASON="the boot log shows: $(printf '%s\n' "$log" | grep -E "$BOOT_ERRORS" | head -1 | cut -c1-200)"
+        return 1
+      fi
+      if [ "$(docker inspect -f '{{.State.Running}}' "$cid")" != true ]; then
+        GATE_REASON="the app container is not running"
+      elif ! docker compose exec -T app wget -q -O /dev/null http://127.0.0.1:3000/up </dev/null >/dev/null 2>&1; then
+        GATE_REASON="/up does not answer inside the app container"
+      else
+        missing=""
+        for p in "${pats[@]}"; do
+          printf '%s\n' "$log" | grep -qE "$p" || missing="$missing '$p'"
+        done
+        if [ -n "$missing" ]; then
+          GATE_REASON="boot line(s) missing:$missing"
+        elif [ -n "$url" ] && [ "$url" != none ]; then
+          code="$(curl -s -o /dev/null -w '%{http_code}' -m 10 "$url" || true)"
+          [ "$code" = 200 ] || GATE_REASON="$url answers HTTP $code"
+        fi
+      fi
+    fi
+
+    [ -z "$GATE_REASON" ] && return 0
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      GATE_REASON="$GATE_REASON (after ${BOOT_TIMEOUT}s)"
+      return 1
+    fi
+    sleep 5
+  done
+}
+
+# Puts back the overlay and compose file saved before step 3, recreates the
+# app on them and checks that the result is healthy. Always ends the run.
+rollback() {
+  local why="$1" d
+  printf '\n[deploy] %s\n' "$why" >&2
+  [ -n "${prev:-}" ] && [ -f "$prev/docker-compose.yml" ] \
+    || die "and there is no previous overlay to put back. The stack is in the state shown above."
+  say "ROLLING BACK to the overlay that was in place before (${prev_sha:-commit not recorded})"
+  for d in "${OVERLAY_DIRS[@]}"; do
+    rm -rf "./$d"
+    [ -d "$prev/$d" ] && cp -a "$prev/$d" "./$d"
+  done
+  cp -a "$prev/docker-compose.yml" ./docker-compose.yml
+  if [ "${2:-}" = "files-only" ]; then
+    die "$why Nothing had been restarted; the previous files are back in place. .deployed_sha is unchanged."
+  fi
+  docker compose up -d </dev/null || true
+  docker compose up -d --no-deps --force-recreate app </dev/null || true
+  if health_gate; then
+    die "deploy of $DEPLOY_SHA was rolled back: $why
+       The previous overlay is running and passed the health gate. .deployed_sha is unchanged.
+       Database migrations, if the new version ran any, were not reversed. The dump from before this run: ${dump:-none (SKIP_DB_BACKUP)}"
+  fi
+  die "deploy of $DEPLOY_SHA failed, AND the rollback did not pass the health gate: $GATE_REASON
+       Look now: docker compose logs app --since 10m
+       The dump from before this run: ${dump:-none (SKIP_DB_BACKUP)}"
+}
 
 # Prints "host_path container_path" for every overlay bind mount, that is every
 # mount whose source sits in one of OVERLAY_DIRS. Secrets are left out on
@@ -90,12 +218,13 @@ verify_overlay_live() {
     dsts+=("$dst")
   done < <(overlay_mounts)
 
-  [ "${#srcs[@]}" -gt 0 ] || die "found no overlay bind mounts in docker-compose.yml to verify."
+  VERIFY_REASON=""
+  [ "${#srcs[@]}" -gt 0 ] || { VERIFY_REASON="found no overlay bind mounts in docker-compose.yml to verify."; return 1; }
 
   host_sums="$(sha256sum "${srcs[@]}" | awk '{print $1}')" \
-    || die "could not checksum the overlay files on the host."
+    || { VERIFY_REASON="could not checksum the overlay files on the host."; return 1; }
   live_sums="$(docker compose exec -T app sha256sum "${dsts[@]}" </dev/null | awk '{print $1}')" \
-    || die "could not read the overlay files inside the app container. Is it running? Check 'docker compose ps'."
+    || { VERIFY_REASON="could not read the overlay files inside the app container."; return 1; }
 
   while IFS= read -r h && IFS= read -r l <&3; do
     if [ "$h" != "$l" ]; then
@@ -105,11 +234,9 @@ verify_overlay_live() {
     i=$((i + 1))
   done < <(printf '%s\n' "$host_sums") 3< <(printf '%s\n' "$live_sums")
 
-  [ "$i" = "${#srcs[@]}" ] || die "compared $i of ${#srcs[@]} overlay files; the container returned a short list."
+  [ "$i" = "${#srcs[@]}" ] || { VERIFY_REASON="compared $i of ${#srcs[@]} overlay files; the container returned a short list."; return 1; }
 
-  [ "$stale" = "0" ] || die "the running app container does not see $stale of the overlay files just deployed
-       (listed above). Run 'docker compose up -d --no-deps --force-recreate app'
-       and run this script again to check."
+  [ "$stale" = "0" ] || { VERIFY_REASON="the running app container does not see $stale of the overlay files just deployed (listed above)."; return 1; }
 
   say "the running app container sees all ${#srcs[@]} overlay files as deployed."
 }
@@ -168,6 +295,15 @@ main() {
     [ -d "$tmp/repo/$d" ] || die "commit $DEPLOY_SHA has no $d/ directory."
   done
 
+  # What is in place now, so that any failure from here on can put it back.
+  prev="$tmp/prev"
+  prev_sha="$(cat .deployed_sha 2>/dev/null || true)"
+  mkdir -p "$prev"
+  for d in "${OVERLAY_DIRS[@]}"; do
+    [ -d "./$d" ] && cp -a "./$d" "$prev/$d"
+  done
+  [ -f docker-compose.yml ] && cp -a docker-compose.yml "$prev/docker-compose.yml"
+
   for d in "${OVERLAY_DIRS[@]}"; do
     rm -rf "./$d"
     cp -r "$tmp/repo/$d" "./$d"
@@ -188,10 +324,10 @@ main() {
     fi
   done < <(grep -oE '^[[:space:]]*-[[:space:]]+\./[^:]+' docker-compose.yml | sed 's/^[[:space:]]*-[[:space:]]*//')
 
-  [ "$missing" = "0" ] || die "the bind-mount sources listed above are missing or are directories.
-       Nothing was restarted. Generate the missing secrets (see README,
-       'The signing key' and the Phase E certificate block), remove any stray
-       directory under secrets/, then run this again."
+  [ "$missing" = "0" ] || rollback "the bind-mount sources listed above are missing or are directories.
+       Generate the missing secrets (see README, 'The signing key' and the
+       Phase E certificate block), remove any stray directory under secrets/,
+       then run this again." files-only
   say "all bind-mount sources are present and are files."
 
   # --- 5. up -----------------------------------------------------------------
@@ -199,24 +335,24 @@ main() {
   say "starting the stack with ${image#image: }"
 
   before="$(docker compose ps -q app </dev/null || true)"
-  docker compose up -d </dev/null
+  docker compose up -d </dev/null || rollback "docker compose up failed (output above)."
   after="$(docker compose ps -q app </dev/null || true)"
 
   # Same container id means compose saw no configuration change and left the
   # app running on the previous overlay files. See the header.
   if [ -n "$before" ] && [ "$before" = "$after" ]; then
     say "the app container was not recreated (its configuration did not change), so it is still running the previous overlay files; recreating it"
-    docker compose up -d --no-deps --force-recreate app </dev/null
+    docker compose up -d --no-deps --force-recreate app </dev/null || rollback "recreating the app container failed (output above)."
   fi
 
-  say "waiting 45s for migrations and boot, then printing the ICODOS diagnostics"
-  sleep 45
-  docker compose logs app --since 5m </dev/null 2>&1 \
-    | grep -E '\[sso\]|\[mcp-oauth\]|\[icodos-contracts\]|\[icodos-reveal\]|\[icodos-reminders\]|Migrating|FATAL|Error' \
-    || say "no ICODOS diagnostic lines found yet; check 'docker compose logs app' by hand."
+  say "waiting up to ${BOOT_TIMEOUT}s for the health gate: /up inside and through the proxy, and the boot line of every feature"
+  health_gate || rollback "the new overlay did not pass the health gate: $GATE_REASON"
+  say "health gate passed. Boot lines:"
+  docker compose logs app --no-color --since "$(docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q app </dev/null)")" </dev/null 2>&1 \
+    | grep -E '\[sso\]|\[mcp-oauth\]|\[icodos-contracts\]|\[icodos-reveal\]|\[icodos-reminders\]|Migrating' | cut -c1-240 || true
 
   # --- 6. prove it ----------------------------------------------------------
-  verify_overlay_live
+  verify_overlay_live || rollback "$VERIFY_REASON"
 
   # Written last, so the file never names a commit that is not the one running.
   [ -f .deployed_sha ] && cp .deployed_sha .deployed_sha.prev

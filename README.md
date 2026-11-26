@@ -318,11 +318,46 @@ Both inherit `Mcp::McpBaseController`, so authentication, the archived-user chec
 |---|---|
 | `search_templates`, `load_template`, `search_documents` | yes, read only, upstream |
 | `icodos_create_contract_template`, `icodos_send_contract` | yes |
-| `send_documents`, `create_template` | **no**, hidden since 25 November 2026 |
+| `send_documents`, `create_template` | **no**, refused since 25 November 2026 |
+| any tool a later upstream version adds | **no**, until it is reviewed and named in `ICODOS_MCP_UPSTREAM_TOOLS` |
 
-The two hidden tools are upstream's. They sat next to the guarded ICODOS tools with none of the guards: any template to any recipient with random signing order, and a server-side fetch of any `https` address. The guards therefore protected only an agent that chose the guarded tool, and an instruction smuggled into a document gives an agent no reason to. A hidden tool is absent from `tools/list`; a client that still calls it from an older list gets a tool error naming what to use instead.
+The policy is an allowlist. `send_documents` and `create_template` sat next to the guarded ICODOS tools with none of the guards: any template to any recipient with random signing order, and a server-side fetch of any `https` address. The guards therefore protected only an agent that chose the guarded tool, and an instruction smuggled into a document gives an agent no reason to. The first version hid those two by name, which would have offered every tool a later upstream version adds the moment the image was bumped. A refused tool is absent from `tools/list`; a client that still calls it from an older list gets the tool error `tool_refused` naming what to use instead.
 
-`ICODOS_MCP_HIDDEN_TOOLS` controls this: unset hides these two, a comma-separated list hides exactly that list, `none` offers everything upstream ships. It is independent of `ICODOS_CONTRACTS_ENABLED` on purpose. A lapsed Graph certificate switches the contract tools off, and that must not be what puts the unguarded tools back.
+`ICODOS_MCP_UPSTREAM_TOOLS` controls this: unset or empty offers the three read-only tools above, a comma-separated list offers exactly those upstream tools, `none` offers no upstream tool, `all` offers everything upstream ships, reviewed or not. The ICODOS tools are not part of the list. It is independent of `ICODOS_CONTRACTS_ENABLED` on purpose: a lapsed Graph certificate switches the contract tools off, and that must not be what puts the unguarded tools back. The boot line `[icodos-contracts] tool policy: upstream_offered=… upstream_refused=…` shows the result; an upstream tool nobody here has reviewed is named in a warning. The former `ICODOS_MCP_HIDDEN_TOOLS` is no longer read, and an error line says so if it is still set.
+
+### Errors the tools return
+
+Every failure of the two ICODOS tools is a tool error (`isError: true`) whose text is one JSON object:
+
+```json
+{"error": "preview_expired", "message": "...", "retryable": false,
+ "hint": "Make a new preview and show it to the requester.", "done": "nothing", "request_id": "..."}
+```
+
+`retryable` is true only when the same call may simply be repeated later. `done` says what had already happened: `nothing`, or a sentence naming what now exists and must not be created or sent again. `request_id` matches the log and the audit record. The codes:
+
+| Code | Meaning | Retryable |
+|---|---|---|
+| `invalid_arguments` | an argument is missing, malformed or contradicts the template | no |
+| `not_found` | no such template in this account | no |
+| `disabled` | the contract tools are off on this instance | no |
+| `path_refused` | a path outside the permitted folders, or malformed | no |
+| `invalid_pdf` | the source file is empty, too large, not a PDF or unreadable | no |
+| `template_archived`, `template_not_original` | the template cannot be sent from here | no |
+| `fixed_term_refused` | fixed-term employment documents are signed on paper for now | no |
+| `preview_required`, `preview_invalid`, `preview_mismatch`, `preview_expired` | the confirmation is not bound to a preview of these arguments; make a new preview | no |
+| `in_progress` | an identical call is running right now; repeat the same call shortly | yes |
+| `store_unreachable` | Redis cannot be asked; nothing was sent | yes |
+| `sharepoint_not_found`, `sharepoint_error` | SharePoint refused the request | no |
+| `sharepoint_unavailable`, `sharepoint_unreachable` | SharePoint is busy or the network failed | yes |
+| `sharepoint_config` | the server's SharePoint access is broken; an administrator must act | no |
+| `submission_failed`, `save_failed` | DocuSeal did not build or save the record | no |
+| `internal_error` | anything nobody anticipated; logged with its class and place | no |
+| `tool_refused` | the tool is not offered on this instance | no |
+
+### Repeated calls
+
+Both tools can be called again safely after a timeout. The send tool answers a confirmed call whose `preview_token` was already used with the send it made then (`"replayed": true`), not with a second one; a send that fails before the invitations go out removes its submission and releases the token, so the identical call can be repeated. The create tool checks every field, including its page against the PDF's page count, before anything is saved, so a refusal leaves nothing behind; an identical call by the same user within 24 hours returns the template the first one made (`"reused": true`), and while one call is creating, an identical one is told `in_progress`.
 
 ### The audit record
 
@@ -444,7 +479,7 @@ Deliveries are recorded as `WebhookEvent`s and visible in the DocuSeal UI, so fa
 | `ICODOS_CONTRACTS_FIXED_TERM_GUARD` | Optional; `on` (default) refuses fixed-term employment documents, `off` lifts it |
 | `ICODOS_AUDIT_DIR` | Optional; where the audit record of tool calls is written, default `/data/docuseal/icodos_audit` |
 | `ICODOS_FILING_HOOK_URL` | Optional; the filing hook's registered address, default `http://app:3000/icodos/hooks/filing` |
-| `ICODOS_MCP_HIDDEN_TOOLS` | Optional; unset hides `send_documents` and `create_template`. `none` hides nothing |
+| `ICODOS_MCP_UPSTREAM_TOOLS` | Optional; the upstream tools agents may use. Unset: `search_templates`, `load_template`, `search_documents`. `none` or `all` |
 
 ### The credential
 

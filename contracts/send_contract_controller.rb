@@ -6,14 +6,21 @@
 # Mounted read-only at /app/app/controllers/mcp/icodos_send_contract_controller.rb
 #
 # THIS IS THE IRREVERSIBLE STEP. It emails a real person, usually at a private
-# address, about their own employment. Two properties follow from that:
+# address, about their own employment. Three properties follow from that:
 #
 #   1. It is a SEPARATE tool from template creation, so preparing a contract
 #      can never send one as a side effect.
-#   2. It does nothing unless confirm is true. Without it the tool returns a
-#      preview — who would receive what, in which order — and sends nothing.
-#      That gives the human an actual decision to make rather than a tool call
-#      to notice after the fact.
+#   2. Without confirm it returns a preview: who receives what, in which
+#      order, with which message, filed where, and a preview_token. Nothing is
+#      sent.
+#   3. It sends only with confirm true AND the preview_token of a preview of
+#      exactly the same arguments, within 15 minutes, once. A confirmation is
+#      therefore bound to what a human was shown, not to whatever the second
+#      call happens to carry.
+#
+# And the ICODOS signer, who signs first, is told in the invitation who the
+# document goes to next and where the signed copy is filed, so the one person
+# who sees the contract before the employee does can stop a wrong address.
 #
 # WHY NOT upstream send_documents
 # It has no signing-order parameter and falls back to the template preference,
@@ -30,9 +37,14 @@ module Mcp
       name: 'icodos_send_contract',
       title: 'Send ICODOS Contract for Signature',
       description: 'Send a prepared contract template for signature, employer first. IRREVERSIBLE: it emails ' \
-                   'the employee. Call with confirm omitted or false to get a preview of exactly what would ' \
-                   'be sent, show that to the human, and only call again with confirm true once they have ' \
-                   'agreed. Never set confirm true on your own initiative.',
+                   'the signers. Two calls. First call without confirm: returns a preview of exactly what ' \
+                   'would be sent (signers in order, each signer\'s email subject and text, filing folder, ' \
+                   'expiry, email code) and a preview_token. Show ALL of it to the human, the email texts ' \
+                   'included. Only after they agree, call again with the identical arguments plus confirm true ' \
+                   'and that preview_token. The token is valid for 15 minutes and works once; any changed ' \
+                   'argument needs a new preview. Never set confirm on your own initiative. Fixed-term ' \
+                   'employment documents (working student, internship, thesis, fixed-term contracts, amendments ' \
+                   'that set or extend an end date) are refused for now; they are signed on paper.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -58,13 +70,22 @@ module Mcp
               required: %w[role name email]
             }
           },
+          fixed_term: {
+            type: 'boolean',
+            description: 'Required. true if the document sets, extends or changes an end date of an employment ' \
+                         '(fixed-term contract, working student, internship or thesis agreement, an amendment ' \
+                         'that sets or extends an end date); false otherwise. true is refused for now.'
+          },
           expire_at: {
             type: 'string',
-            description: 'Optional expiry, ISO 8601 date or datetime'
+            description: 'Optional expiry. ISO 8601 datetime, or a date (YYYY-MM-DD), which means the end of ' \
+                         'that day in the account time zone. Must be at least one hour ahead. Signing is no ' \
+                         'longer possible after it.'
           },
           message: {
             type: 'object',
-            description: 'Optional email subject and body',
+            description: 'Optional email subject and body for every signer. Without it the template and ' \
+                         'account defaults are used. The preview shows the resulting text per signer.',
             properties: {
               subject: { type: 'string' },
               body: { type: 'string' }
@@ -75,13 +96,24 @@ module Mcp
             description: 'Optional override for where the signed PDF is filed. Defaults to the folder recorded ' \
                          'on the template at creation time, which is almost always what you want.'
           },
+          require_email_code: {
+            type: 'boolean',
+            description: 'Optional. true: every signer must enter a code sent to their email address before ' \
+                         'the document opens; false: nobody. Leave it out for the server default (a code for ' \
+                         'addresses outside the company). The preview shows the value per signer.'
+          },
           confirm: {
             type: 'boolean',
-            description: 'Must be the boolean true to actually send. Anything else, the string "true" included, ' \
-                         'returns a preview and sends nothing.'
+            description: 'Must be the boolean true, together with preview_token, to actually send. Anything ' \
+                         'else returns a preview and sends nothing.'
+          },
+          preview_token: {
+            type: 'string',
+            description: 'The preview_token from the preview of exactly these arguments. Required with ' \
+                         'confirm true.'
           }
         },
-        required: %w[template_id submitters]
+        required: %w[template_id submitters fixed_term]
       },
       annotations: {
         readOnlyHint: false,
@@ -91,8 +123,12 @@ module Mcp
       }
     }.freeze
 
-    EMAIL_RE = /\A[^@\s]+@[^@\s]+\.[^@\s]+\z/
+    EMAIL_RE = /\A[^@\s]+@[^@\s]+\.[^@\s]+\z/.freeze
     FILING_FOLDER_KEY = 'icodos_filing_folder'
+    SOURCE_PATH_KEY = 'icodos_source_path'
+    PREVIEW_NONCE_KEY = 'icodos_preview_nonce'
+    DATE_ONLY_RE = /\A\d{4}-\d{2}-\d{2}\z/.freeze
+    MIN_EXPIRY = 3600
 
     # The first signer is structurally the employer — the template's role order
     # decides who signs first, and for ICODOS employment documents that is
@@ -107,7 +143,105 @@ module Mcp
     # for instance. The error message says so when it fires.
     DEFAULT_FIRST_SIGNER_DOMAINS = %w[icodos.com icodos.de].freeze
 
+    # Fixed-term employment documents are signed on paper for now, by
+    # company decision, not through this instance. Two lines: the caller must
+    # declare fixed_term, and the names on the template are checked for the
+    # document classes that are fixed-term here (working student, intern,
+    # thesis, extensions). The second line does not trust the first.
+    # "unbefristet" (permanent) is not a match.
+    # ICODOS_CONTRACTS_FIXED_TERM_GUARD=off lifts it, on the server only.
+    FIXED_TERM_PATTERN = /
+      werk\s*student | working[\s-]*student | praktik | \bintern(ship)?s?\b |
+      \bthesis\b | abschlussarbeit | masterarbeit | bachelorarbeit |
+      (?<!un)befrist | fixed[\s-]*term | time[\s-]*limit(ed|ation)? |
+      verl(ä|ae)ngerung | \bextension\b
+    /xi.freeze
+
+    FIXED_TERM_REFUSAL =
+      'Fixed-term employment documents (working student, internship, thesis, fixed-term contracts, amendments ' \
+      'that set or extend an end date) are signed on paper for now, not through this instance. Nothing was sent.'
+
+    # Used for the first signer only, when neither the call, the template nor
+    # the account settings provide an invitation text to add the note to.
+    FALLBACK_BODY = "Hello {submitter.first_name},\n\n" \
+                    "You have been invited to sign \"{template.name}\":\n\n" \
+                    "{submitter.link}\n\n" \
+                    "If you have any questions, reply to this email.\n\n" \
+                    "Thanks,  \n{account.name}"
+
     class InvalidArguments < StandardError; end
+
+    # A confirmation is valid only for what was previewed. The token is
+    #
+    #   pv1.<expiry, unix seconds>.<nonce, 32 hex>.<HMAC-SHA256, 64 hex>
+    #
+    # and the HMAC covers the user and a digest of everything the preview
+    # showed: template and its content, signers in order, each signer's email
+    # subject and text, filing folder, expiry, email code. The confirming call
+    # recomputes that digest from its own arguments, so a token cannot carry a
+    # changed address, message or folder across. Single use: the nonce is
+    # recorded in Redis with SET NX before anything is sent, and on the
+    # submission, which survives a Redis that lost its last minutes.
+    #
+    # Plain Ruby, no Rails: contracts/token_selftest.rb runs it offline.
+    module PreviewToken
+      VERSION = 'pv1'
+      TTL = 15 * 60
+      FORMAT = /\Apv1\.(\d{10})\.(\h{32})\.(\h{64})\z/.freeze
+
+      module_function
+
+      # Hash keys sorted at every level, so the digest does not depend on the
+      # order in which a caller or this code happened to build the hash.
+      def canonical(value)
+        case value
+        when Hash then value.map { |k, v| [k.to_s, canonical(v)] }.sort_by(&:first)
+        when Array then value.map { |v| canonical(v) }
+        else value
+        end
+      end
+
+      def digest(content)
+        OpenSSL::Digest::SHA256.hexdigest(JSON.generate(canonical(content)))
+      end
+
+      def mac(key, user_id, exp, nonce, digest)
+        OpenSSL::HMAC.hexdigest('SHA256', key, [VERSION, user_id.to_i, exp.to_i, nonce, digest].join('|'))
+      end
+
+      def issue(key, user_id, digest, now: Time.now.to_i, nonce: SecureRandom.hex(16))
+        exp = now.to_i + TTL
+
+        [VERSION, exp, nonce, mac(key, user_id, exp, nonce, digest)].join('.')
+      end
+
+      # { status: :ok, nonce:, exp: } or { status: :malformed | :mismatch | :expired }.
+      # The MAC is checked before the expiry, so an expired token with
+      # different arguments reports the difference, which is the more useful
+      # of the two.
+      def verify(token, key, user_id, digest, now: Time.now.to_i)
+        match = FORMAT.match(token.to_s)
+
+        return { status: :malformed } unless match
+
+        exp = match[1].to_i
+        nonce = match[2]
+
+        return { status: :mismatch } unless secure_compare(mac(key, user_id, exp, nonce, digest), match[3])
+        return { status: :expired, exp: exp } if now.to_i > exp
+
+        { status: :ok, nonce: nonce, exp: exp }
+      end
+
+      def secure_compare(left, right)
+        return false unless left.bytesize == right.bytesize
+
+        bytes = left.bytes
+        diff = 0
+        right.bytes.each_with_index { |byte, i| diff |= byte ^ bytes[i] }
+        diff.zero?
+      end
+    end
 
     # rubocop:disable Metrics
     def call
@@ -126,34 +260,30 @@ module Mcp
       # Same refusal as upstream send_documents since 3.4.0.
       raise InvalidArguments, 'templates with variables are not supported' if @template.variables_schema.present?
 
+      ensure_not_fixed_term!
       ensure_first_role_signs!
 
       authorize!(:create, Submission.new(template: @template, account_id: current_user.account_id))
 
       ordered = match_submitters!(Array.wrap(mcp_params['submitters']))
       filing_folder = resolve_filing_folder!
-
       expire_at = parse_expire_at!(mcp_params['expire_at'])
+      email_code = resolve_email_codes!(ordered)
+      messages = build_messages(ordered, filing_folder, expire_at)
+
+      digest = PreviewToken.digest(previewed_content(ordered, filing_folder, expire_at, email_code, messages))
 
       # Preview path — no side effects whatsoever.
       #
-      # Exactly the JSON boolean true sends. This used to be a Rails boolean
-      # cast, which treats everything outside a short list of false values as
-      # true: "False", "no", "preview", "null" and 2 all sent the contract,
-      # while the schema promised that anything but true only previews.
+      # Exactly the JSON boolean true sends, and only with the token of a
+      # preview of these same arguments. confirm used to be a Rails boolean
+      # cast ("False", "no" and 2 all sent), and later a bare `== true` that
+      # the very first call could carry, with arguments nobody had seen.
       unless mcp_params['confirm'] == true
-        return render_tool_result(
-          sent: false,
-          preview: true,
-          template: { id: @template.id, name: @template.name },
-          signing_order: ordered.map { |s| { role: s['role'], name: s['name'], email: s['email'] } },
-          first_invitation_to: ordered.first['email'],
-          remaining_notified_after: ordered.first['role'],
-          filing_folder: filing_folder,
-          expire_at: expire_at&.iso8601,
-          note: 'Nothing has been sent. Show this to the requester and call again with confirm true if they agree.'
-        )
+        return render_preview(ordered, filing_folder, expire_at, email_code, messages, digest)
       end
+
+      nonce = accept_preview_token!(digest)
 
       submissions = Submissions.create_from_submitters(
         template: @template,
@@ -163,10 +293,15 @@ module Mcp
         # 'random' when the preference is unset, which silently emails the
         # employee before the employer has signed.
         submitters_order: 'preserved',
-        submissions_attrs: { submitters: ordered },
-        # ordered appears in BOTH places, as upstream does it: submissions_attrs
-        # builds the records, params drives per-submitter delivery.
-        params: build_params(expire_at).merge('submitters' => ordered)
+        # expire_at belongs HERE. Upstream reads it from the submission
+        # attributes only; passed in params, as it was until November 2026,
+        # it was echoed by the preview and silently dropped, and the account's
+        # invitation text "Could you sign by {submission.expire_at}?" went
+        # out with a blank date.
+        submissions_attrs: { submitters: submitter_attrs(ordered, messages, email_code), expire_at: expire_at },
+        # Both places, as upstream does it: submissions_attrs builds the
+        # records, params drives per-submitter delivery.
+        params: { 'send_email' => true, 'submitters' => submitter_attrs(ordered, messages, email_code) }
       )
 
       raise InvalidArguments, 'no valid submitters' if submissions.blank?
@@ -188,8 +323,10 @@ module Mcp
 
       # Carried onto the submission so the filing hook needs neither the
       # template nor any parsing of its name to know where the signed PDF goes.
+      # The preview nonce makes the single use survive a Redis restart.
       submissions.each do |submission|
-        submission.update!(preferences: (submission.preferences || {}).merge(FILING_FOLDER_KEY => filing_folder))
+        submission.update!(preferences: (submission.preferences || {}).merge(FILING_FOLDER_KEY => filing_folder,
+                                                                             PREVIEW_NONCE_KEY => nonce))
       end
 
       WebhookUrls.enqueue_events(submissions, 'submission.created')
@@ -198,13 +335,16 @@ module Mcp
       submission = submissions.first
 
       Rails.logger.info("[icodos-contracts] sent submission=#{submission.id} template=#{@template.id} " \
-                        "order=preserved filing=#{filing_folder.inspect}")
+                        "order=preserved filing=#{filing_folder.inspect} preview=#{nonce[0, 8]} " \
+                        "email_code=#{email_code.join(',')} expire_at=#{expire_at&.iso8601 || 'none'}")
 
       render_tool_result(
         sent: true,
         submission_id: submission.id,
         template: { id: @template.id, name: @template.name },
-        signing_order: submission.submitters.map { |s| { name: s.name, email: s.email, status: s.status } },
+        signing_order: submission.submitters.map do |s|
+          { name: s.name, email: s.email, status: s.status, email_code: s.preferences['require_email_2fa'] == true }
+        end,
         filing_folder: filing_folder,
         expire_at: submission.expire_at&.iso8601
       )
@@ -225,6 +365,210 @@ module Mcp
 
     private
 
+    def render_preview(ordered, filing_folder, expire_at, email_code, messages, digest)
+      token = PreviewToken.issue(preview_key, current_user.id, digest)
+      expires = Time.at(token.split('.')[1].to_i).utc
+
+      Rails.logger.info("[icodos-contracts] preview template=#{@template.id} user_id=#{current_user.id} " \
+                        "preview=#{token.split('.')[2][0, 8]}")
+
+      render_tool_result(
+        sent: false,
+        preview: true,
+        template: { id: @template.id, name: @template.name },
+        documents: Array.wrap(@template.schema).map { |item| item['name'] },
+        signing_order: ordered.each_with_index.map do |s, i|
+          { order: i + 1, role: s['role'], name: s['name'], email: s['email'], email_code: email_code[i] }
+        end,
+        first_invitation_to: ordered.first['email'],
+        remaining_notified_after: ordered.first['role'],
+        filing_folder: filing_folder,
+        expire_at: expire_at&.iso8601,
+        template_default_expiry: expire_at ? nil : template_expiry_default['default_expire_at_duration'],
+        emails: messages.map do |m|
+          { to: m['email'], role: m['role'], source: m['source'],
+            subject: m['subject'] || '(DocuSeal standard subject)', body: m['body'] || '(DocuSeal standard text)' }
+        end,
+        preview_token: token,
+        preview_token_expires_at: expires.iso8601,
+        note: 'Nothing has been sent. Show the requester all of the above, the email texts included ({...} ' \
+              'placeholders are filled in per signer when sent). If they agree, call again with exactly the ' \
+              'same arguments plus confirm true and this preview_token, before preview_token_expires_at. ' \
+              'The token works once.'
+      )
+    end
+
+    # Everything the preview shows, nothing it does not. Template content is
+    # bound too: a template edited between preview and send needs a new
+    # preview, because the document itself is part of what was agreed.
+    def previewed_content(ordered, filing_folder, expire_at, email_code, messages)
+      {
+        'template_id' => @template.id,
+        'template_content' => template_fingerprint,
+        'signers' => ordered.map { |s| [s['role'], s['name'], s['email']] },
+        'filing_folder' => filing_folder,
+        'expire_at' => expire_at&.utc&.iso8601,
+        'email_code' => email_code,
+        'emails' => messages.map { |m| [m['role'], m['subject'], m['body']] }
+      }
+    end
+
+    def template_fingerprint
+      documents = @template.documents.map { |d| [d.try(:uuid).to_s, d.blob&.checksum.to_s] }
+
+      PreviewToken.digest('submitters' => @template.submitters, 'fields' => @template.fields,
+                          'schema' => @template.schema, 'documents' => documents,
+                          'expiry_default' => template_expiry_default)
+    end
+
+    # Applies when the call gives no expire_at (Templates.build_default_expire_at).
+    # Bound as the setting, not as a time, which would differ between calls.
+    def template_expiry_default
+      @template.preferences.to_h.slice('default_expire_at_duration', 'default_expire_at').compact
+    end
+
+    def preview_key
+      Rails.application.key_generator.generate_key('icodos send_contract preview token v1', 32)
+    end
+
+    # Returns the nonce once the token is proven to belong to this preview and
+    # has been recorded as used. Raises otherwise; nothing has been sent then.
+    def accept_preview_token!(digest)
+      token = mcp_params['preview_token']
+
+      if token.blank?
+        raise InvalidArguments,
+              'confirm true needs the preview_token from a preview of exactly these arguments. Call without ' \
+              'confirm first, show the preview to the requester, then confirm with its preview_token. ' \
+              'Nothing was sent.'
+      end
+
+      result = PreviewToken.verify(token, preview_key, current_user.id, digest)
+
+      case result[:status]
+      when :malformed
+        raise InvalidArguments, 'preview_token is not a token this tool issued. Nothing was sent.'
+      when :mismatch
+        raise InvalidArguments,
+              'preview_token does not match these arguments: something differs from what was previewed (a ' \
+              'signer, an address, the message, the filing folder, the expiry, the email code or the ' \
+              'template itself), or the token belongs to another preview or user. Nothing was sent. Make a ' \
+              'new preview and show it to the requester.'
+      when :expired
+        raise InvalidArguments,
+              "preview_token expired at #{Time.at(result[:exp]).utc.iso8601} (valid 15 minutes). Nothing was " \
+              'sent. Make a new preview and show it to the requester.'
+      end
+
+      burn_preview_nonce!(result[:nonce], result[:exp])
+
+      result[:nonce]
+    end
+
+    def burn_preview_nonce!(nonce, exp)
+      ttl = [exp - Time.now.to_i, 0].max + 300
+      key = "icodos:send_contract:preview:#{nonce}"
+
+      stored =
+        begin
+          ::Sidekiq.redis { |c| c.call('SET', key, current_user.id.to_s, 'NX', 'EX', ttl) }
+        rescue StandardError => e
+          Rails.logger.error("[icodos-contracts] send_contract: preview store unreachable (#{e.class}: #{e.message})")
+
+          raise InvalidArguments, 'the record of used preview tokens (Redis) is not reachable, so nothing was ' \
+                                  'sent. Retry in a minute with the same preview_token.'
+        end
+
+      used_before = stored != 'OK' ||
+                    Submission.where(account_id: current_user.account_id)
+                              .where('created_at > ?', Time.at(exp) - PreviewToken::TTL - 600)
+                              .where('preferences LIKE ?', "%#{nonce}%")
+                              .exists?
+
+      return unless used_before
+
+      raise InvalidArguments,
+            'this preview_token has already been used to send. Nothing was sent again. If a second copy ' \
+            'really is wanted, make a new preview and show it to the requester.'
+    end
+
+    def ensure_not_fixed_term!
+      return if ENV['ICODOS_CONTRACTS_FIXED_TERM_GUARD'].to_s.strip.casecmp('off').zero?
+
+      declared = mcp_params['fixed_term']
+
+      unless [true, false].include?(declared)
+        raise InvalidArguments,
+              'fixed_term is required, as the boolean true or false: does this document set, extend or change ' \
+              'an end date of an employment (fixed-term contract, working student, internship or thesis ' \
+              'agreement, an amendment that sets or extends an end date)? Read the document to answer it.'
+      end
+
+      raise InvalidArguments, FIXED_TERM_REFUSAL if declared == true
+
+      hit = fixed_term_hit
+
+      return unless hit
+
+      raise InvalidArguments,
+            "#{FIXED_TERM_REFUSAL} (The template looks fixed-term: #{hit[:where]} contains #{hit[:match].inspect}. " \
+            'If that is wrong, the guard can only be lifted on the server.)'
+    end
+
+    def fixed_term_hit
+      source = @template.preferences.to_h[SOURCE_PATH_KEY].to_s
+
+      corpus = [['the template name', @template.name.to_s],
+                ['the source file name', File.basename(source)]]
+      corpus += Array.wrap(@template.schema).map { |item| ['a document name', item['name'].to_s] }
+      corpus += Array.wrap(@template.submitters).map { |item| ['a role name', item['name'].to_s] }
+
+      corpus.each do |where, text|
+        match = text.unicode_normalize(:nfc).match(FIXED_TERM_PATTERN)
+
+        return { where: where, match: match[0] } if match
+      end
+
+      nil
+    end
+
+    # Per signer, in signing order: whether the signing page asks for a code
+    # mailed to the signer's address before the document opens (upstream's
+    # require_email_2fa, plan step 4.2). A call may say true (everyone) or
+    # false (nobody). Otherwise ICODOS_CONTRACTS_EMAIL_CODE decides:
+    #
+    #   external (default)  addresses outside the company domains, which are
+    #                       the employees' private addresses. Staff mailboxes
+    #                       sit behind Microsoft sign-in with MFA already, so a
+    #                       code to the same mailbox adds little, and monthly
+    #                       time declarations between staff stay as they were.
+    #   all                 every signer
+    #   off                 nobody
+    #
+    # Decided by David on 26 November 2026 (D14). The company domains are the
+    # first-signer domains.
+    def resolve_email_codes!(ordered)
+      value = mcp_params['require_email_code']
+
+      return ordered.map { value } if [true, false].include?(value)
+      raise InvalidArguments, 'require_email_code must be the boolean true or false' unless value.nil?
+
+      case self.class.email_code_policy
+      when 'all' then ordered.map { true }
+      when 'off' then ordered.map { false }
+      else
+        domains = first_signer_domains
+
+        ordered.map { |s| !domains.include?(s['email'].to_s.split('@').last.to_s.downcase) }
+      end
+    end
+
+    def self.email_code_policy
+      value = ENV.fetch('ICODOS_CONTRACTS_EMAIL_CODE', 'external').to_s.strip.downcase
+
+      %w[all off].include?(value) ? value : 'external'
+    end
+
     # Returns submitters ordered to match the TEMPLATE's roles. The order of the
     # incoming array is deliberately ignored: employer-first is a property of
     # the template, not of however the caller happened to list people.
@@ -234,6 +578,8 @@ module Mcp
       template_roles = @template.submitters.map { |s| s['name'] }
 
       supplied = raw.map do |entry|
+        raise InvalidArguments, 'each submitter must be an object with role, name and email' unless entry.is_a?(Hash)
+
         role = entry['role'].to_s.strip
         name = entry['name'].to_s.strip
         email = entry['email'].to_s.strip
@@ -267,6 +613,98 @@ module Mcp
       enforce_first_signer_domain!(ordered.first)
 
       ordered
+    end
+
+    # The attributes handed to upstream. The first signer carries its own
+    # message: the invitation text plus the note naming who signs next and
+    # where the signed copy is filed. With a message in the call, everyone
+    # gets exactly the text the preview showed them (a subject left out is
+    # filled from the defaults, not by upstream's generic one). Without one,
+    # the others get upstream's own defaults, unchanged.
+    def submitter_attrs(ordered, messages, email_code)
+      ordered.each_with_index.map do |s, i|
+        attrs = s.dup
+        attrs['require_email_2fa'] = email_code[i]
+
+        if i.zero? || given_message
+          attrs['message'] = { 'subject' => messages[i]['subject'], 'body' => messages[i]['body'] }.compact
+        end
+
+        attrs
+      end
+    end
+
+    # What each signer's invitation will say, in signing order, as the preview
+    # shows it and the token binds it. Mirrors upstream's choice in
+    # SubmitterMailer#invitation_email: a message given with the call, else
+    # the template's per-role text, else the template's text, else the
+    # account's invitation email setting, else DocuSeal's built-in text.
+    def build_messages(ordered, filing_folder, expire_at)
+      roles = Array.wrap(@template.submitters)
+      per_role = Array.wrap(@template.preferences.to_h['submitters']).index_by { |e| e['uuid'] }
+      config = AccountConfig.find_by(account_id: current_user.account_id,
+                                     key: AccountConfig::SUBMITTER_INVITATION_EMAIL_KEY)&.value
+      config = {} unless config.is_a?(Hash)
+
+      ordered.each_with_index.map do |s, i|
+        uuid = roles.find { |r| r['name'] == s['role'] }.to_h['uuid']
+        role_prefs = per_role[uuid].to_h
+
+        subject = given_message&.dig('subject') ||
+                  role_prefs['request_email_subject'].presence ||
+                  @template.preferences.to_h['request_email_subject'].presence ||
+                  config['subject'].presence
+        body = given_message&.dig('body') ||
+               role_prefs['request_email_body'].presence ||
+               @template.preferences.to_h['request_email_body'].presence ||
+               config['body'].presence
+        source = given_message ? 'message given in this call' : 'template and account defaults'
+
+        if i.zero?
+          subject ||= I18n.t(:you_are_invited_to_sign_a_document)
+          body = "#{body || FALLBACK_BODY}\n\n#{first_signer_note(ordered, filing_folder, expire_at)}"
+          source += ', plus the note for the first signer'
+        end
+
+        { 'role' => s['role'], 'email' => s['email'], 'source' => source, 'subject' => subject, 'body' => body }
+      end
+    end
+
+    # The first signer is the only person who sees the document before the
+    # second party is contacted. Telling them who that is, and where the
+    # signed copy will be kept, is what makes their signature a check.
+    def first_signer_note(ordered, filing_folder, expire_at)
+      later = ordered.drop(1).map do |s|
+        "#{plain(s['role'])}: #{plain(s['name'])}, #{plain(s['email'])}  "
+      end
+
+      lines = ['**Please check before you sign.** When you have signed, this document goes to:', '']
+      lines += later.empty? ? ['(nobody else; you are the only signer)'] : later
+      lines += ['', "Once everyone has signed, the signed PDF is filed in SharePoint: #{plain(filing_folder)}"]
+      lines += ['', "Signing closes on #{plain(expire_at.strftime('%Y-%m-%d %H:%M %Z'))}."] if expire_at
+      lines += ['', 'If a name, an address or the folder is wrong, do not sign. Reply to this email instead.']
+
+      lines.join("\n")
+    end
+
+    # Names, addresses and folders come from the caller. In the note they
+    # must read as text: no markdown emphasis or links, no {variables} that
+    # upstream would fill in, no HTML.
+    def plain(text)
+      text.to_s.gsub(/[\[\]*~`<>{}\\]/, ' ').gsub('++', '+')
+          .gsub(%r{://}i, ': //').gsub(/\bwww\./i, 'www .')
+          .gsub(/[[:cntrl:]]/, ' ').squeeze(' ').strip
+    end
+
+    def given_message
+      return @given_message if defined?(@given_message)
+
+      raw = mcp_params['message']
+
+      @given_message =
+        if raw.is_a?(Hash) && (raw['subject'].to_s.strip.present? || raw['body'].to_s.strip.present?)
+          { 'subject' => raw['subject'].to_s.strip.presence, 'body' => raw['body'].to_s.presence }.compact
+        end
     end
 
     # The first-signer domain guard below constrains the address of the FIRST
@@ -334,25 +772,26 @@ module Mcp
       folder
     end
 
+    # A date alone means the end of that day where the account is, not its
+    # first second: "sign by 5 December" must not close at midnight before it.
     def parse_expire_at!(raw)
       return nil if raw.blank?
 
-      Time.zone.parse(raw.to_s) || raise(InvalidArguments, "expire_at #{raw.inspect} is not a date I can read")
+      zone = ActiveSupport::TimeZone[current_user.account.timezone.to_s] || Time.zone
+      text = raw.to_s.strip
+      time = text.match?(DATE_ONLY_RE) ? zone.parse(text)&.end_of_day : zone.parse(text)
+
+      raise InvalidArguments, "expire_at #{raw.inspect} is not a date I can read" if time.nil?
+
+      if time < Time.current + MIN_EXPIRY
+        raise InvalidArguments, "expire_at #{time.utc.iso8601} is less than an hour ahead; signing would close " \
+                                'before anyone could sign'
+      end
+
+      time
     rescue ArgumentError
       raise InvalidArguments, "expire_at #{raw.inspect} is not a date I can read"
     end
 
-    def build_params(expire_at)
-      params = { 'send_email' => true }
-      params['expire_at'] = expire_at if expire_at
-
-      message = mcp_params['message']
-
-      if message.is_a?(Hash) && (message['subject'].present? || message['body'].present?)
-        params['message'] = message.slice('subject', 'body')
-      end
-
-      params
-    end
   end
 end

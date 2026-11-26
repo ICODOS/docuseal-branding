@@ -308,7 +308,7 @@ Same overlay pattern as Phase D: bind-mounted files, no image rebuild, no new ge
 | Tool | What it does |
 |---|---|
 | `icodos_create_contract_template` | Reads a PDF from the SharePoint contracts folder, creates a template with fields placed, roles assigned, folder set, and the filing destination recorded |
-| `icodos_send_contract` | Sends for signature with `submitters_order: 'preserved'`. Returns a **preview** and sends nothing unless `confirm` is true |
+| `icodos_send_contract` | Sends for signature with `submitters_order: 'preserved'`. Without `confirm` it returns a **preview** (signers in order, each signer's email text, filing folder, expiry, email code) and a `preview_token`, and sends nothing. It sends only with `confirm: true` plus the token of a preview of exactly the same arguments |
 
 Both inherit `Mcp::McpBaseController`, so authentication, the archived-user check and the Phase D OAuth hook apply exactly as they do to the upstream tools. Archiving a DocuSeal user still revokes access.
 
@@ -363,15 +363,22 @@ Documents are often written through the OneDrive-synced library on a Mac, so the
 
 The create tool also checks the file actually starts with `%PDF-`, so a `.docx` passed by mistake, or a half-written file, fails at creation rather than at signature time.
 
-`contracts/selftest.rb` covers this offline, with no network, credentials or Rails:
+`contracts/selftest.rb` covers this offline, with no network, credentials or Rails, and `contracts/send_selftest.rb` the send tool's preview token, fixed-term pattern, email code default and the plain-text note to the first signer:
 
 ```bash
 ruby contracts/selftest.rb
+ruby contracts/send_selftest.rb
 ```
 
 ### Other deliberate constraints
 
-- **Sending is a separate tool from preparing**, so a contract can never be sent as a side effect of building one, and `confirm` must be the JSON boolean `true` or the tool only previews. It used to be a Rails boolean cast, under which `"False"`, `"no"` and `2` all sent.
+- **Sending is a separate tool from preparing**, so a contract can never be sent as a side effect of building one.
+- **A confirmation is bound to its preview.** The preview returns a `preview_token`: an HMAC over the user and a digest of everything the preview showed (the template and its content, signers in order, each signer's email subject and text, filing folder, expiry, email code). `confirm: true` sends only with that token and the same arguments, within 15 minutes, once; the nonce is recorded in Redis before anything is sent and on the submission afterwards. A changed address, message or folder, a template edited in between, another user's token or a second use is refused and nothing is sent. Before 26 November 2026 the first call could carry `confirm: true` with arguments nobody had seen; before 25 November `confirm` was a Rails boolean cast, under which `"False"`, `"no"` and `2` all sent.
+- **The preview shows the email text per signer.** With a `message` in the call that text; otherwise the template's and then the account's invitation text, exactly as `SubmitterMailer` would choose it. `{...}` placeholders are filled in per signer when sent.
+- **The first signer's invitation names who signs next and where the signed copy is filed.** The ICODOS signer is the only person who sees the document before the other party is contacted, so their invitation ends with the next signers (role, name, address), the filing folder and the expiry, and asks them not to sign if any of it is wrong. Caller-supplied values are inserted as plain text: no links, emphasis, HTML or `{variables}`.
+- **`expire_at` takes effect.** It is passed where upstream reads it (the submission attributes); until 26 November 2026 it was echoed by the preview and dropped, and the account's invitation text "Could you sign by {submission.expire_at}?" went out with a blank date. A date alone means the end of that day in the account's time zone; less than an hour ahead is refused.
+- **Email code before signing.** Upstream's `require_email_2fa`, per signer. By default (`ICODOS_CONTRACTS_EMAIL_CODE=external`) signers outside the first-signer domains get it, which are the employees' private addresses; staff mailboxes already sit behind Microsoft sign-in. `all` and `off` are the alternatives; a call can say `require_email_code: true` (everyone) or `false` (nobody), and the preview shows the value per signer.
+- **Fixed-term employment documents are refused**, for now: they are signed on paper. The caller must state `fixed_term` for every send, and the template name, source file name, document names and role names are checked for working student, intern, thesis, fixed-term and extension wording (permanent, "unbefristet", is not a match). `ICODOS_CONTRACTS_FIXED_TERM_GUARD=off` lifts it on the server.
 - **Every role must own a signature field.** Upstream turns a role without fields into a viewer and invites the next role at once, so a template whose fields all belonged to the employee passed the first-signer check on the employer's address and then went straight to the employee. The create tool refuses such a field list before reading the file; the send tool refuses a template whose first role does not sign.
 - **The first signer must be at a configured domain** (`ICODOS_CONTRACTS_FIRST_SIGNER_DOMAINS`, default `icodos.com,icodos.de`). The first signer countersigns for ICODOS; without this, an instruction smuggled into a document could send a fabricated contract with both roles pointed at addresses an attacker controls.
 - **Filing never overwrites.** A name collision files alongside with a numeric suffix and logs a warning, because silently replacing an executed employment contract is not an acceptable failure mode.
@@ -405,7 +412,9 @@ Deliveries are recorded as `WebhookEvent`s and visible in the DocuSeal UI, so fa
 | `ICODOS_GRAPH_SITE_HOSTNAME` | e.g. `<tenant>.sharepoint.com` |
 | `ICODOS_GRAPH_SITE_PATH` | e.g. `/sites/<site>` |
 | `ICODOS_CONTRACTS_PATH_PREFIX` | The only subtree these tools may touch |
-| `ICODOS_CONTRACTS_FIRST_SIGNER_DOMAINS` | Optional; defaults to `icodos.com,icodos.de` |
+| `ICODOS_CONTRACTS_FIRST_SIGNER_DOMAINS` | Optional; defaults to `icodos.com,icodos.de`. Also the company domains for the email code default |
+| `ICODOS_CONTRACTS_EMAIL_CODE` | Optional; `external` (default), `all` or `off`: who enters an emailed code before the document opens |
+| `ICODOS_CONTRACTS_FIXED_TERM_GUARD` | Optional; `on` (default) refuses fixed-term employment documents, `off` lifts it |
 | `ICODOS_MCP_HIDDEN_TOOLS` | Optional; unset hides `send_documents` and `create_template`. `none` hides nothing |
 
 ### The credential

@@ -236,7 +236,10 @@ Rails.application.config.after_initialize do
         "[icodos-contracts] enabled. site=#{IcodosGraph.site_hostname}#{IcodosGraph.site_path} " \
         "prefixes=#{IcodosGraph.path_prefixes.inspect} " \
         "tools=#{IcodosContracts::TOOL_CONTROLLER_NAMES.keys.join(',')} " \
-        "cert_expires=#{IcodosGraph.certificate.not_after.utc.iso8601}"
+        "cert_expires=#{IcodosGraph.certificate.not_after.utc.iso8601} " \
+        'send=preview_token ' \
+        "fixed_term_guard=#{ENV['ICODOS_CONTRACTS_FIXED_TERM_GUARD'].to_s.strip.casecmp('off').zero? ? 'off' : 'on'} " \
+        "email_code=#{Mcp::IcodosSendContractController.email_code_policy}"
       )
     else
       Rails.logger.info('[icodos-contracts] disabled (ICODOS_CONTRACTS_ENABLED is not true, or configuration is unusable)')

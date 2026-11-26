@@ -156,6 +156,16 @@ services:
       # to. Defaults to icodos.com,icodos.de when unset — see the constant in
       # send_contract_controller.rb for why this guard exists.
       - ICODOS_CONTRACTS_FIRST_SIGNER_DOMAINS=${ICODOS_CONTRACTS_FIRST_SIGNER_DOMAINS:-}
+      # Which signers icodos_send_contract asks for a code sent to their
+      # email address before the document opens (upstream's
+      # require_email_2fa), unless a call says otherwise: external (signers
+      # outside the first-signer domains, the default), all, or off. The
+      # preview shows the value per signer.
+      - ICODOS_CONTRACTS_EMAIL_CODE=${ICODOS_CONTRACTS_EMAIL_CODE:-external}
+      # icodos_send_contract refuses fixed-term employment documents; they
+      # are signed on paper for now. off lifts it. See FIXED_TERM_PATTERN in
+      # contracts/send_contract_controller.rb.
+      - ICODOS_CONTRACTS_FIXED_TERM_GUARD=${ICODOS_CONTRACTS_FIXED_TERM_GUARD:-on}
       # Upstream MCP tools not offered to agents on this instance, because they
       # carry none of the guards of the two ICODOS tools. See the constant
       # DEFAULT_HIDDEN_TOOLS in contracts/zz_icodos_contracts.rb. Deliberately

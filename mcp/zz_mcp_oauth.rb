@@ -103,7 +103,7 @@ Rails.application.config.after_initialize do
           "[mcp-oauth] enabled. issuer=#{McpOauth.issuer} resource=#{McpOauth.resource} " \
           "kid=#{McpOauth.current_kid[0, 12]} access_ttl=#{McpOauth.access_token_ttl}s " \
           "refresh_ttl=#{McpOauth.refresh_token_ttl}s redirect_hosts=#{McpOauth.allowed_redirect_hosts.join(',')} " \
-          'single_use=redis'
+          "redirect_uris=#{McpOauth.allowed_redirect_uris.size} single_use=redis"
         )
 
         # Upstream config/puma.rb runs a cluster when EITHER of these is set.

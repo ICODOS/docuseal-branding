@@ -221,7 +221,7 @@ One scope, `mcp`, meaning "use the MCP tools as this DocuSeal user, with that us
 
 ### Redirect URI allowlist
 
-Dynamic client registration has to be open, because there's no way to pre-share a credential with Claude. What keeps that safe is that registered `redirect_uris` must be on an allowlisted host — default **`claude.ai, claude.com`** — so a stranger cannot register a client that redirects authorization codes to a host they control. HTTPS is required, with no userinfo, no fragment, and no `code` / `state` / `iss` / `error` query parameter that could collide with what we append on the way back.
+Dynamic client registration has to be open, because there's no way to pre-share a credential with Claude. What keeps that safe is that a registered https `redirect_uri` must be one of a short list of exact addresses, by default **`https://claude.ai/api/mcp/auth_callback`** (the address the claude.ai connector registers, seen in the log on 26 November 2026) and its `claude.com` counterpart, so a stranger cannot register a client that redirects authorization codes anywhere else, not even to another path on those hosts. Until November 2026 only the host was checked. `MCP_OAUTH_ALLOWED_REDIRECT_URIS` replaces the list; narrowing it also invalidates clients registered with an address no longer on it, because every client_id is re-checked when it is used. HTTPS is required, with no userinfo, no fragment, and no `code` / `state` / `iss` / `error` query parameter that could collide with what we append on the way back.
 
 **Loopback (`localhost`, `127.0.0.1`, `::1`) is deliberately excluded from the default.** A loopback `redirect_uri` means "hand the authorization code to a process on this user's own machine", and any local process can bind a port and claim to be a legitimate client. Combined with open registration, that is a one-click consent-phishing route to a grant with the user's full DocuSeal permissions — the security review called this out and it is why the default was narrowed. The hosted Claude surfaces (claude.ai web, Desktop, mobile, Cowork) all use the `claude.ai` callback, so nothing we need is lost. If a local MCP client genuinely needs it later, add the hosts to `MCP_OAUTH_ALLOWED_REDIRECT_HOSTS`; the RFC 8252 port-agnostic match is still implemented (path and query are still compared exactly, and userinfo and fragments are refused).
 
@@ -236,7 +236,8 @@ Only the first one is required; everything else has a sensible default.
 | `MCP_OAUTH_PREVIOUS_SIGNING_KEY_PATH` | Optional. Published in JWKS during a key rotation. |
 | `MCP_OAUTH_ISSUER` | Default derived from the app's configured host (`https://sign.icodos.com`) |
 | `MCP_OAUTH_RESOURCE` | Default `<issuer>/mcp` |
-| `MCP_OAUTH_ALLOWED_REDIRECT_HOSTS` | Comma separated. Default `claude.ai,claude.com` — loopback deliberately excluded, see above |
+| `MCP_OAUTH_ALLOWED_REDIRECT_HOSTS` | Comma separated. Default `claude.ai,claude.com`; loopback deliberately excluded, see above |
+| `MCP_OAUTH_ALLOWED_REDIRECT_URIS` | Comma separated exact https callback addresses. Default `https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback` |
 | `MCP_OAUTH_ACCESS_TOKEN_TTL` | Seconds. Default `3600`, clamped to a 24 h ceiling |
 | `MCP_OAUTH_REFRESH_TOKEN_TTL` | Seconds. Default `1209600` (14 days, absolute), clamped to a 90 day ceiling |
 

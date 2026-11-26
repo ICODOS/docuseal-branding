@@ -100,6 +100,20 @@ module McpOauth
   # MCP_OAUTH_ALLOWED_REDIRECT_HOSTS only if a local MCP client actually needs it.
   DEFAULT_ALLOWED_REDIRECT_HOSTS = %w[claude.ai claude.com].freeze
 
+  # Exact https callback addresses (finding A8). The host list alone let any
+  # path on claude.ai or claude.com receive an authorization code. The claude.ai
+  # connector registered https://claude.ai/api/mcp/auth_callback on
+  # 26 November 2026 (seen in the registration log line); the claude.com form
+  # is Anthropic's documented counterpart for the same connectors. An https
+  # redirect_uri must equal one of these; loopback http addresses keep the RFC
+  # 8252 rules below and the host list. Narrowing this list also invalidates
+  # client_ids registered with an address that is no longer on it (parse_client
+  # re-filters), which is why it was set from an observed registration.
+  DEFAULT_ALLOWED_REDIRECT_URIS = %w[
+    https://claude.ai/api/mcp/auth_callback
+    https://claude.com/api/mcp/auth_callback
+  ].freeze
+
   CLIENT_ID_PREFIX = 'icd1'
   CLIENT_ID_MAC_CONTEXT = 'icodos-mcp-oauth/client-id/v1'
 
@@ -275,6 +289,15 @@ module McpOauth
       begin
         raw = ENV['MCP_OAUTH_ALLOWED_REDIRECT_HOSTS'].to_s.split(',').map { |h| h.strip.downcase }.reject(&:empty?)
         (raw.presence || DEFAULT_ALLOWED_REDIRECT_HOSTS).freeze
+      end
+  end
+
+  # MCP_OAUTH_ALLOWED_REDIRECT_URIS, comma separated, replaces the default list.
+  def allowed_redirect_uris
+    @allowed_redirect_uris ||=
+      begin
+        raw = ENV['MCP_OAUTH_ALLOWED_REDIRECT_URIS'].to_s.split(',').map(&:strip).reject(&:empty?)
+        (raw.presence || DEFAULT_ALLOWED_REDIRECT_URIS).freeze
       end
   end
 
@@ -511,7 +534,7 @@ module McpOauth
     end
 
     case uri.scheme
-    when 'https' then true
+    when 'https' then allowed_redirect_uris.include?(value)
     when 'http'  then loopback_host?(host) # RFC 8252 native-client loopback only
     else false
     end

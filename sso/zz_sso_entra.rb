@@ -12,6 +12,8 @@
 #   ENTRA_CLIENT_SECRET   App registration client secret (never log)
 #   SSO_ENFORCE           "true" blocks password login. Default: false.
 #   SSO_BREAK_GLASS       "true" re-enables password login even when SSO_ENFORCE=true.
+#   SSO_ALLOWED_DOMAINS   comma-separated email domains a Microsoft account must have to be
+#                         bound or provisioned at its first sign-in. Empty: none can be.
 
 module Sso
   module_function
@@ -92,6 +94,80 @@ module Sso
   # token, set a password and signed the user in while enforcement was on. Any
   # signed-in user can mint such a token from the user settings.
   ENFORCED_CONTROLLERS = %w[SessionsController PasswordsController InvitationsController].freeze
+
+  # Who a Microsoft sign-in is, and which DocuSeal user that makes it.
+  #
+  # Until 26 November 2026 the callback joined on the email claim alone:
+  # whichever DocuSeal user had that address was signed in, and if none had,
+  # an ADMIN was created. Both sides of that join are editable. Any admin here
+  # can change any user's email in the settings, and Entra addresses get
+  # renamed and, after someone leaves, reissued. So a renamed or reissued
+  # address inherited an existing record with its API key, and an admin who
+  # swapped two addresses in the settings could sign in as a colleague. Nothing
+  # in code checked tenant membership or domain either: the portal setting
+  # "Assignment required" was the only gate, and a guest assigned to the app,
+  # or the setting switched off, would have become an admin. Finding A4.
+  #
+  # Now the immutable pair tid/oid is bound to the user record at the first
+  # sign-in and matched on afterwards:
+  #
+  #   - The token must carry tid and oid, tid must be ENTRA_TENANT_ID, and the
+  #     account must be a member: a guest's token carries an idp claim naming
+  #     its home identity provider. (This holds for a tenant whose domains are
+  #     managed. With a federated domain a member's idp may name the federation
+  #     server; revisit this rule before federating one.)
+  #   - A bound pair signs in to its own record, whatever either email now says.
+  #   - An unbound pair needs an address in SSO_ALLOWED_DOMAINS. It then takes
+  #     the record with that address if the record is not bound yet, or gets a
+  #     new one, and the pair is bound. A record already bound to another pair
+  #     is refused: that is a renamed or reissued address.
+  #
+  # The binding lives in user_configs under KEY, an upstream table, so there is
+  # no migration. UserConfigsController accepts only two other keys, so a user
+  # cannot write it from the settings page.
+  module Identity
+    KEY = 'icodos_entra_identity'
+
+    module_function
+
+    def allowed_domains
+      ENV['SSO_ALLOWED_DOMAINS'].to_s.split(',').map { |d| d.strip.downcase.delete_prefix('@') }
+                                .reject(&:empty?).uniq
+    end
+
+    def domain_allowed?(email)
+      allowed_domains.include?(email.to_s.split('@').last.to_s.downcase)
+    end
+
+    # Returns [identity, nil] for a usable member token, [nil, reason] otherwise.
+    def from_claims(claims)
+      tid = claims['tid'].to_s.strip.downcase
+      oid = claims['oid'].to_s.strip.downcase
+      return [nil, 'token carries no tid or oid'] if tid.empty? || oid.empty?
+      return [nil, 'token is from another tenant'] unless tid == ENV['ENTRA_TENANT_ID'].to_s.strip.downcase
+
+      idp = claims['idp'].to_s.strip
+      if !idp.empty? && ![claims['iss'].to_s, "https://sts.windows.net/#{tid}/"].include?(idp)
+        return [nil, 'guest account (authenticated by another identity provider)']
+      end
+
+      ["#{tid}/#{oid}", nil]
+    end
+
+    def user_for(identity)
+      UserConfig.where(key: KEY).includes(:user).to_a
+                .find { |c| c.value.is_a?(Hash) && c.value['id'] == identity }&.user
+    end
+
+    def identity_of(user)
+      value = UserConfig.find_by(user_id: user.id, key: KEY)&.value
+      value.is_a?(Hash) ? value['id'] : nil
+    end
+
+    def bind!(user, identity)
+      UserConfig.create!(user: user, key: KEY, value: { 'id' => identity, 'bound_at' => Time.now.utc.iso8601 })
+    end
+  end
 end
 
 # Prevent client_secret, authorization code, and tokens from ever hitting the
@@ -129,11 +205,18 @@ Rails.application.config.after_initialize do
     strategy_off = User.singleton_class.ancestors.include?(Sso::NoPasswordStrategy) &&
                    !User.params_authenticatable?(:database)
 
+    domains = Sso::Identity.allowed_domains
     Rails.logger.info(
       "[sso] configured=#{Sso.configured?} enforce=#{Sso.enforced?} break_glass=#{Sso.break_glass?} " \
       "password_login=#{Sso.password_login_allowed? ? 'ALLOWED' : 'blocked'} " \
-      "password_strategy=#{strategy_off ? 'off' : 'ON'}"
+      "password_strategy=#{strategy_off ? 'off' : 'ON'} " \
+      "identity=tid+oid allowed_domains=#{domains.empty? ? 'NONE' : domains.join(',')}"
     )
+
+    if Sso.configured? && domains.empty?
+      Rails.logger.warn('[sso] SSO_ALLOWED_DOMAINS is empty: accounts already bound still sign in, ' \
+                        'but no new Microsoft account can be bound or provisioned.')
+    end
 
     if !Sso.password_login_allowed? && !strategy_off
       Rails.logger.error('[sso] password login is meant to be blocked but the password strategy is still ON. ' \

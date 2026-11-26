@@ -4,8 +4,10 @@
 # Mounted read-only from the docuseal-branding overlay; see sso/README section.
 #
 # Flow: authorization code + PKCE, id_token verified against Entra JWKS.
-# User mapping: preferred_username / email claim, case-insensitive match against
-# an existing DocuSeal user. No auto-provisioning. Break-glass via env flag.
+# User mapping: the token's tid/oid, bound to the DocuSeal user at the first
+# sign-in (see Sso::Identity in zz_sso_entra.rb). A first sign-in matches an
+# unbound user by email or provisions an admin, only for a member account with
+# an address in SSO_ALLOWED_DOMAINS. Break-glass via env flag.
 
 module Sso
   class EntraAuthController < ApplicationController
@@ -137,18 +139,29 @@ module Sso
         return fail_login('Microsoft sign-in did not return an email address.')
       end
 
+      # Tenant, member, and the immutable identity, before anything else uses
+      # the token. See Sso::Identity for why the email alone is not enough.
+      identity, refusal = ::Sso::Identity.from_claims(claims)
+      if identity.nil?
+        Rails.logger.warn("[sso] refused: #{refusal}")
+        return fail_login('This Microsoft account cannot sign in here. Contact your administrator.')
+      end
+
       # API-key re-authentication branches out here, BEFORE the sign-in logic
       # below. Critically before reset_session — this flow must leave the
       # existing session intact, not replace it.
-      return complete_reveal!(reveal_intent, claims, email) if reveal_intent.present?
+      return complete_reveal!(reveal_intent, claims, identity) if reveal_intent.present?
 
-      user = User.where('LOWER(email) = ?', email).first
+      user = ::Sso::Identity.user_for(identity)
 
       if user.nil?
-        user = provision_from_claims!(email, claims)
-        if user.nil?
-          return fail_login('Unable to create your DocuSeal account. Contact your administrator.')
-        end
+        user, message = bind_first_sign_in(identity, email, claims)
+        return fail_login(message) if user.nil?
+      elsif user.email.to_s.strip.downcase != email
+        # Bound records follow the Microsoft account, not the address. Worth a
+        # line, because it means one side renamed and the other did not.
+        Rails.logger.info("[sso] user_id=#{user.id} signed in by its bound Entra account; " \
+                          'the DocuSeal email differs from the Microsoft one')
       end
 
       unless user.active_for_authentication?
@@ -177,6 +190,41 @@ module Sso
       false
     end
 
+    # The first sign-in of a Microsoft account that is not bound to any user.
+    # Returns [user, nil] once bound, or [nil, message for the person].
+    def bind_first_sign_in(identity, email, claims)
+      unless ::Sso::Identity.domain_allowed?(email)
+        Rails.logger.warn("[sso] refused: first sign-in with a domain outside SSO_ALLOWED_DOMAINS (#{email.split('@').last})")
+        return [nil, 'This Microsoft account cannot sign in here. Contact your administrator.']
+      end
+
+      user = User.where('LOWER(email) = ?', email).first
+
+      if user && ::Sso::Identity.identity_of(user)
+        # The address is on a record that belongs to a different Microsoft
+        # account: renamed, reissued after someone left, or edited in the
+        # settings. Signing in would hand over that record and its API key.
+        Rails.logger.warn("[sso] refused: user_id=#{user.id} has this email but is bound to a different " \
+                          'Entra account')
+        return [nil, 'This address belongs to a different Microsoft account here. Contact your administrator.']
+      end
+
+      user ||= provision_from_claims!(email, claims)
+      return [nil, 'Unable to create your DocuSeal account. Contact your administrator.'] if user.nil?
+
+      ::Sso::Identity.bind!(user, identity)
+      Rails.logger.info("[sso] user_id=#{user.id} bound to its Entra account at first sign-in")
+      [user, nil]
+    rescue ActiveRecord::RecordNotUnique
+      # A concurrent first sign-in bound this user a moment ago. Only the same
+      # Microsoft account may continue.
+      bound = ::Sso::Identity.user_for(identity)
+      return [bound, nil] if bound && bound.id == user&.id
+
+      Rails.logger.warn("[sso] refused: user_id=#{user&.id} was bound concurrently to a different Entra account")
+      [nil, 'Sign-in could not be completed. Please try again.']
+    end
+
     def fail_login(message)
       return redirect_to(settings_api_index_path, alert: message) if @icodos_reveal_flow
 
@@ -191,7 +239,7 @@ module Sso
     # check is the one that matters — without it, anyone able to reach a signed-in
     # session could authenticate as themselves at Microsoft and unlock the key
     # belonging to whoever left the browser open.
-    def complete_reveal!(intent, claims, email)
+    def complete_reveal!(intent, claims, identity)
       user = current_user
 
       if user.nil?
@@ -212,7 +260,20 @@ module Sso
         return fail_login('Microsoft did not confirm a fresh sign-in. Please try again.')
       end
 
-      unless ActiveSupport::SecurityUtils.secure_compare(email, user.email.to_s.strip.downcase)
+      # Compared on the bound Entra identity, not the email. The email is
+      # editable in the settings, so comparing it let an admin point their own
+      # address at a colleague's record and be shown the colleague's key
+      # (finding A5). A user who has not signed in since the binding existed
+      # has none yet; that is a refusal, never a binding: binding here would be
+      # exactly the email trust this replaces.
+      bound = ::Sso::Identity.identity_of(user)
+      if bound.nil?
+        Rails.logger.warn("[icodos-reveal] user_id=#{user.id} has no Entra binding yet; refusing")
+
+        return fail_login('Sign out, sign in with Microsoft once, then try again.')
+      end
+
+      unless ActiveSupport::SecurityUtils.secure_compare(identity, bound)
         # Deliberately does not name the account that did authenticate.
         Rails.logger.warn("[icodos-reveal] identity mismatch: session user_id=#{user.id} re-authenticated " \
                           'as a different Microsoft account; refusing')

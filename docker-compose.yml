@@ -120,6 +120,12 @@ services:
       - ENTRA_CLIENT_SECRET=${ENTRA_CLIENT_SECRET:-}
       - SSO_ENFORCE=${SSO_ENFORCE:-false}
       - SSO_BREAK_GLASS=${SSO_BREAK_GLASS:-false}
+      # Email domains a Microsoft account must have to be bound to a DocuSeal
+      # user, or to get one, at its first sign-in. The tenant's member domains.
+      # Accounts already bound sign in whatever their address says now. With
+      # `-`, not `:-`: only an unset variable takes the default, so an empty
+      # value in .env really means "nobody new".
+      - SSO_ALLOWED_DOMAINS=${SSO_ALLOWED_DOMAINS-icodos.com,icodos.de}
       # How long a browser stays signed in without a new Microsoft sign-in.
       # Upstream's default is 730 days, and every SSO sign-in sets the cookie
       # (User#remember_me is always true). A stolen cookie was therefore good

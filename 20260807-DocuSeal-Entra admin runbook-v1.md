@@ -29,7 +29,7 @@ If you also need the original *setup* guide (one-time Azure app registration, `.
 
 - Microsoft's account picker appears (because we default `prompt=select_account`).
 - User picks their ICODOS account, completes any MFA that Entra Conditional Access requires.
-- The OIDC callback auto-creates their DocuSeal user with role `admin`, their name from Entra claims, and a random password they never see.
+- The OIDC callback binds their Microsoft account (`tid`/`oid`) to a DocuSeal user: the existing one with their address if it is not bound yet, otherwise a new one with role `admin`, their name from Entra claims, and a random password they never see. Their address must be in `SSO_ALLOWED_DOMAINS` (default `icodos.com,icodos.de`), and guests are refused.
 - They land on the DocuSeal dashboard as themselves.
 
 ### Verify
@@ -194,6 +194,21 @@ The `ENTRA_CLIENT_SECRET` in `.env` doesn't match what Azure has. Almost always:
 Should not happen anymore since auto-provisioning is on. If it does, either:
 - The user's Entra `preferred_username` / `email` claim is empty (unusual — check their Entra profile has an email set).
 - Auto-provisioning failed silently. Check server logs: `docker compose logs --tail 200 app | grep sso`.
+
+**User sees "This Microsoft account cannot sign in here."**
+The log says why: `docker compose logs --tail 200 app | grep "\[sso\] refused"`. A guest account, a token from another tenant, or a first sign-in with an address outside `SSO_ALLOWED_DOMAINS`. For a new company domain, add it to `SSO_ALLOWED_DOMAINS` in `.env` and `docker compose up -d`.
+
+**User sees "This address belongs to a different Microsoft account here."**
+The DocuSeal user with that address is bound to another Microsoft account. Either the address was reissued to a new person (then the old record is not theirs: archive it and let them sign in again, which creates a fresh user), or the same person got a new Microsoft account (then re-bind the record to them by removing the old binding; it is re-made at their next sign-in):
+
+```bash
+cd /opt/docuseal && docker compose exec -T -w /app app rails runner 'u = User.find_by!(email: "PERSON@icodos.com"); UserConfig.where(user: u, key: Sso::Identity::KEY).destroy_all' </dev/null
+```
+
+Only do the second after confirming in Entra that the old account is gone.
+
+**API key reveal says "Sign out, sign in with Microsoft once, then try again."**
+The session is older than the binding of their account. One sign-out and Microsoft sign-in fixes it.
 
 **User sees "Your account has been archived."**
 Their DocuSeal user exists but is archived. In DocuSeal **Settings → Users** → unarchive them. Alternatively, if you meant to revoke access, do both step 1 and step 2 of section 2.

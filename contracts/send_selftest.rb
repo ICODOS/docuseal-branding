@@ -21,6 +21,23 @@ module Mcp
   class McpBaseController; end
 end
 
+# Stand-in for the structured tool errors defined in zz_icodos_contracts.rb,
+# which needs Rails. Only the error class matters here.
+module IcodosToolErrors
+  class ToolError < StandardError
+    attr_reader :code
+
+    def initialize(message = nil, code: 'invalid_arguments', retryable: false, hint: nil)
+      super(message)
+      @code = code
+      @retryable = retryable
+      @hint = hint
+    end
+  end
+
+  def self.included(_base); end
+end
+
 require_relative 'send_contract_controller'
 
 C = Mcp::IcodosSendContractController

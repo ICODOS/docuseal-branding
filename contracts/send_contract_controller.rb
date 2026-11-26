@@ -169,7 +169,12 @@ module Mcp
                     "If you have any questions, reply to this email.\n\n" \
                     "Thanks,  \n{account.name}"
 
-    class InvalidArguments < StandardError; end
+    # Errors answer as structured tool errors (IcodosToolErrors, finding T5).
+    # InvalidArguments keeps its name for the offline selftests; its code
+    # defaults to invalid_arguments.
+    include ::IcodosToolErrors
+
+    InvalidArguments = ::IcodosToolErrors::ToolError
 
     # A confirmation is valid only for what was previewed. The token is
     #
@@ -252,9 +257,11 @@ module Mcp
       # After authorize!, never before it: an early render ahead of authorize!
       # trips McpBaseController's check_authorization and becomes a bare 500.
       # See IcodosCreateContractTemplateController#call, where it did.
-      return render_tool_error('Phase E is not enabled on this instance') unless IcodosGraph.enabled?
+      unless IcodosGraph.enabled?
+        raise InvalidArguments.new('the contract tools are not enabled on this instance', code: 'disabled')
+      end
 
-      raise InvalidArguments, 'template has been archived' if @template.archived_at?
+      raise InvalidArguments.new('template has been archived', code: 'template_archived') if @template.archived_at?
 
       ensure_original_contract_template!
       raise InvalidArguments, 'template has no fields — nothing to sign' if @template.fields.blank?
@@ -285,87 +292,142 @@ module Mcp
         return render_preview(ordered, filing_folder, expire_at, email_code, messages, digest)
       end
 
-      nonce = accept_preview_token!(digest)
+      nonce, prior = accept_preview_token!(digest)
 
-      submissions = Submissions.create_from_submitters(
-        template: @template,
-        user: current_user,
-        source: :mcp,
-        # Hardcoded, not read from template.preferences. Upstream falls back to
-        # 'random' when the preference is unset, which silently emails the
-        # employee before the employer has signed.
-        submitters_order: 'preserved',
-        # expire_at belongs HERE. Upstream reads it from the submission
-        # attributes only; passed in params, as it was until November 2026,
-        # it was echoed by the preview and silently dropped, and the account's
-        # invitation text "Could you sign by {submission.expire_at}?" went
-        # out with a blank date.
-        submissions_attrs: { submitters: submitter_attrs(ordered, messages, email_code), expire_at: expire_at },
-        # Both places, as upstream does it: submissions_attrs builds the
-        # records, params drives per-submitter delivery.
-        params: { 'send_email' => true, 'submitters' => submitter_attrs(ordered, messages, email_code) }
-      )
+      # The same confirmed call again, typically after a client timeout: the
+      # answer is the send that already happened, not a second one and not an
+      # error the agent might "fix" by making a new preview (finding T6).
+      return render_sent(prior, filing_folder, replayed: true) if prior
 
-      raise InvalidArguments, 'no valid submitters' if submissions.blank?
+      submissions = nil
 
-      # Guard against the silent failure this tool hit during development: the
-      # submission is created, the order is right, and every submitter has a
-      # blank email, so nothing is ever delivered and nothing reports an error.
-      # An inert submission looks sent, which is the worst of both.
-      blank = submissions.flat_map(&:submitters).select { |s| s.email.blank? }
+      # Until the signature requests go out, a failure leaves nothing behind:
+      # the half-made submission is removed and the preview_token released,
+      # so the same confirmed call can simply be repeated.
+      begin
+        submissions = Submissions.create_from_submitters(
+          template: @template,
+          user: current_user,
+          source: :mcp,
+          # Hardcoded, not read from template.preferences. Upstream falls back
+          # to 'random' when the preference is unset, which silently emails the
+          # employee before the employer has signed.
+          submitters_order: 'preserved',
+          # expire_at belongs HERE. Upstream reads it from the submission
+          # attributes only; passed in params, as it was until November 2026,
+          # it was echoed by the preview and silently dropped, and the
+          # account's invitation text "Could you sign by
+          # {submission.expire_at}?" went out with a blank date.
+          submissions_attrs: { submitters: submitter_attrs(ordered, messages, email_code), expire_at: expire_at },
+          # Both places, as upstream does it: submissions_attrs builds the
+          # records, params drives per-submitter delivery.
+          params: { 'send_email' => true, 'submitters' => submitter_attrs(ordered, messages, email_code) }
+        )
 
-      if blank.any?
-        submissions.each(&:destroy!)
+        raise InvalidArguments.new('no valid submitters', code: 'submission_failed') if submissions.blank?
 
-        raise InvalidArguments,
-              "#{blank.length} submitter record(s) came back without an email address; the submission was " \
-              'discarded rather than left undeliverable. This indicates a DocuSeal API change — check that ' \
-              'submitter attributes still reach Submissions::CreateFromSubmitters.'
+        # Guard against the silent failure this tool hit during development:
+        # the submission is created, the order is right, and every submitter
+        # has a blank email, so nothing is ever delivered and nothing reports
+        # an error. An inert submission looks sent, which is the worst of both.
+        blank = submissions.flat_map(&:submitters).select { |s| s.email.blank? }
+
+        if blank.any?
+          raise InvalidArguments.new(
+            "#{blank.length} submitter record(s) came back without an email address; the submission was " \
+            'discarded rather than left undeliverable. This indicates a DocuSeal API change: check that ' \
+            'submitter attributes still reach Submissions::CreateFromSubmitters.',
+            code: 'submission_failed'
+          )
+        end
+
+        # Carried onto the submission so the filing hook needs neither the
+        # template nor any parsing of its name to know where the signed PDF
+        # goes. The preview nonce makes the single use survive a Redis restart.
+        submissions.each do |submission|
+          submission.update!(preferences: (submission.preferences || {}).merge(FILING_FOLDER_KEY => filing_folder,
+                                                                               PREVIEW_NONCE_KEY => nonce))
+        end
+
+        WebhookUrls.enqueue_events(submissions, 'submission.created')
+      rescue StandardError
+        discard_unsent!(submissions, nonce)
+        raise
       end
-
-      # Carried onto the submission so the filing hook needs neither the
-      # template nor any parsing of its name to know where the signed PDF goes.
-      # The preview nonce makes the single use survive a Redis restart.
-      submissions.each do |submission|
-        submission.update!(preferences: (submission.preferences || {}).merge(FILING_FOLDER_KEY => filing_folder,
-                                                                             PREVIEW_NONCE_KEY => nonce))
-      end
-
-      WebhookUrls.enqueue_events(submissions, 'submission.created')
-      Submissions.send_signature_requests(submissions)
 
       submission = submissions.first
+
+      # From here on the invitations are on their way. Whatever fails after
+      # this line, the agent is told so and must not send again.
+      @icodos_done = "sent: submission #{submission.id}; it must not be sent again"
+      Submissions.send_signature_requests(submissions)
+      record_sent!(nonce, submission)
 
       Rails.logger.info("[icodos-contracts] sent submission=#{submission.id} template=#{@template.id} " \
                         "order=preserved filing=#{filing_folder.inspect} preview=#{nonce[0, 8]} " \
                         "email_code=#{email_code.join(',')} expire_at=#{expire_at&.iso8601 || 'none'}")
 
-      render_tool_result(
+      render_sent(submission, filing_folder)
+    end
+    # rubocop:enable Metrics
+
+    private
+
+    def render_sent(submission, filing_folder, replayed: false)
+      result = {
         sent: true,
         submission_id: submission.id,
         template: { id: @template.id, name: @template.name },
         signing_order: submission.submitters.map do |s|
           { name: s.name, email: s.email, status: s.status, email_code: s.preferences['require_email_2fa'] == true }
         end,
-        filing_folder: filing_folder,
+        filing_folder: submission.preferences.to_h[FILING_FOLDER_KEY] || filing_folder,
         expire_at: submission.expire_at&.iso8601
-      )
-    rescue InvalidArguments, IcodosGraph::PathError => e
-      render_tool_error(e.message)
-    rescue IcodosGraph::Error => e
-      Rails.logger.error("[icodos-contracts] send_contract: #{e.class} #{e.message}")
-      render_tool_error("SharePoint: #{e.message}")
-    rescue Faraday::Error => e
-      # Only the filing-folder check talks to Microsoft, and it runs before
-      # anything is sent, so a network failure here never leaves a half-sent
-      # contract. Without this it would be a bare 500.
-      Rails.logger.error("[icodos-contracts] send_contract: #{e.class} #{e.message}")
-      render_tool_error("SharePoint could not be reached (#{e.class.name.demodulize}: #{e.message}). " \
-                        'Nothing was sent; retry in a minute.')
-    end
-    # rubocop:enable Metrics
+      }
 
-    private
+      if replayed
+        Rails.logger.info("[icodos-contracts] replayed submission=#{submission.id} template=#{@template.id} " \
+                          "user_id=#{current_user.id}")
+
+        result[:replayed] = true
+        result[:note] = "This preview_token was already used at #{submission.created_at.utc.iso8601}; this is " \
+                        'that send. Nothing was sent again. If a second copy really is wanted, make a new ' \
+                        'preview and show it to the requester.'
+      end
+
+      render_tool_result(result)
+    end
+
+    # Undo a send that failed before any invitation went out: remove what was
+    # created and release the preview_token, so the identical confirmed call
+    # can be repeated. If even that fails, the error says so.
+    def discard_unsent!(submissions, nonce)
+      Array.wrap(submissions).each { |s| s.destroy! if s.persisted? }
+      ::Sidekiq.redis { |c| c.call('DEL', preview_redis_key(nonce)) }
+
+      @icodos_done = 'nothing (the preview_token may be used again)'
+    rescue StandardError => e
+      Rails.logger.error("[icodos-contracts] send_contract: could not discard an unsent submission " \
+                         "(#{e.class}: #{e.message}) template=#{@template.id}")
+
+      @icodos_done = "unknown: a submission of template #{@template.id} may exist without having been sent. " \
+                     'Check the template in the web interface before sending again.'
+    end
+
+    # The used token now points at its submission, for a repeated call.
+    def record_sent!(nonce, submission)
+      ::Sidekiq.redis do |c|
+        c.call('SET', preview_redis_key(nonce), "submission:#{submission.id}", 'XX', 'KEEPTTL')
+      end
+    rescue StandardError => e
+      # The nonce on the submission still makes a repeat a replay.
+      Rails.logger.error("[icodos-contracts] send_contract: could not record the send against its preview " \
+                         "(#{e.class}: #{e.message}) submission=#{submission.id}")
+    end
+
+    def preview_redis_key(nonce)
+      "icodos:send_contract:preview:#{nonce}"
+    end
 
     def render_preview(ordered, filing_folder, expire_at, email_code, messages, digest)
       token = PreviewToken.issue(preview_key, current_user.id, digest)
@@ -433,65 +495,97 @@ module Mcp
       Rails.application.key_generator.generate_key('icodos send_contract preview token v1', 32)
     end
 
-    # Returns the nonce once the token is proven to belong to this preview and
-    # has been recorded as used. Raises otherwise; nothing has been sent then.
+    # Returns [nonce, nil] once the token is proven to belong to this preview
+    # and has been recorded as used, or [nonce, submission] when it was
+    # already used and that send is found. Raises otherwise; nothing has been
+    # sent then.
+    # rubocop:disable Metrics
     def accept_preview_token!(digest)
       token = mcp_params['preview_token']
+      new_preview = 'Make a new preview and show it to the requester.'
 
       if token.blank?
-        raise InvalidArguments,
-              'confirm true needs the preview_token from a preview of exactly these arguments. Call without ' \
-              'confirm first, show the preview to the requester, then confirm with its preview_token. ' \
-              'Nothing was sent.'
+        raise InvalidArguments.new(
+          'confirm true needs the preview_token from a preview of exactly these arguments. Nothing was sent.',
+          code: 'preview_required',
+          hint: 'Call without confirm first, show the preview to the requester, then confirm with its preview_token.'
+        )
       end
 
       result = PreviewToken.verify(token, preview_key, current_user.id, digest)
 
       case result[:status]
       when :malformed
-        raise InvalidArguments, 'preview_token is not a token this tool issued. Nothing was sent.'
+        raise InvalidArguments.new('preview_token is not a token this tool issued. Nothing was sent.',
+                                   code: 'preview_invalid', hint: new_preview)
       when :mismatch
-        raise InvalidArguments,
-              'preview_token does not match these arguments: something differs from what was previewed (a ' \
-              'signer, an address, the message, the filing folder, the expiry, the email code or the ' \
-              'template itself), or the token belongs to another preview or user. Nothing was sent. Make a ' \
-              'new preview and show it to the requester.'
+        raise InvalidArguments.new(
+          'preview_token does not match these arguments: something differs from what was previewed (a signer, ' \
+          'an address, the message, the filing folder, the expiry, the email code or the template itself), or ' \
+          'the token belongs to another preview or user. Nothing was sent.',
+          code: 'preview_mismatch', hint: new_preview
+        )
       when :expired
-        raise InvalidArguments,
-              "preview_token expired at #{Time.at(result[:exp]).utc.iso8601} (valid 15 minutes). Nothing was " \
-              'sent. Make a new preview and show it to the requester.'
+        raise InvalidArguments.new(
+          "preview_token expired at #{Time.at(result[:exp]).utc.iso8601} (valid 15 minutes). Nothing was sent.",
+          code: 'preview_expired', hint: new_preview
+        )
       end
 
-      burn_preview_nonce!(result[:nonce], result[:exp])
-
-      result[:nonce]
+      [result[:nonce], burn_preview_nonce!(result[:nonce], result[:exp])]
     end
+    # rubocop:enable Metrics
 
+    # nil when this call may send; the earlier submission when the token was
+    # used before. Raises while another call with the same token is still
+    # sending, and when Redis cannot be asked.
     def burn_preview_nonce!(nonce, exp)
       ttl = [exp - Time.now.to_i, 0].max + 300
-      key = "icodos:send_contract:preview:#{nonce}"
+      key = preview_redis_key(nonce)
 
-      stored =
+      stored, value =
         begin
-          ::Sidekiq.redis { |c| c.call('SET', key, current_user.id.to_s, 'NX', 'EX', ttl) }
+          ::Sidekiq.redis do |c|
+            set = c.call('SET', key, "pending:#{current_user.id}", 'NX', 'EX', ttl)
+            [set, set == 'OK' ? nil : c.call('GET', key)]
+          end
         rescue StandardError => e
           Rails.logger.error("[icodos-contracts] send_contract: preview store unreachable (#{e.class}: #{e.message})")
 
-          raise InvalidArguments, 'the record of used preview tokens (Redis) is not reachable, so nothing was ' \
-                                  'sent. Retry in a minute with the same preview_token.'
+          raise InvalidArguments.new('the record of used preview tokens (Redis) is not reachable, so nothing was sent.',
+                                     code: 'store_unreachable', retryable: true,
+                                     hint: 'Retry the same call, with the same preview_token, in a minute.')
         end
 
-      used_before = stored != 'OK' ||
-                    Submission.where(account_id: current_user.account_id)
-                              .where('created_at > ?', Time.at(exp) - PreviewToken::TTL - 600)
-                              .where('preferences LIKE ?', "%#{nonce}%")
-                              .exists?
+      prior = sent_with(nonce, exp, value)
 
-      return unless used_before
+      if stored == 'OK'
+        # A Redis that lost its last minutes forgets a used token; the
+        # submission does not. Point the record at it again and replay.
+        ::Sidekiq.redis { |c| c.call('SET', key, "submission:#{prior.id}", 'XX', 'KEEPTTL') } if prior
 
-      raise InvalidArguments,
-            'this preview_token has already been used to send. Nothing was sent again. If a second copy ' \
-            'really is wanted, make a new preview and show it to the requester.'
+        return prior
+      end
+
+      return prior if prior
+
+      raise InvalidArguments.new(
+        'another call with this preview_token is sending right now. Nothing was sent by this call.',
+        code: 'in_progress', retryable: true,
+        hint: 'Wait half a minute and repeat the same call; it then answers with that send. If it still says ' \
+              'this after two minutes, look at the template\'s submissions in the web interface before making ' \
+              'a new preview.'
+      )
+    end
+
+    def sent_with(nonce, exp, value)
+      id = value.to_s[/\Asubmission:(\d+)\z/, 1]
+      scope = Submission.where(account_id: current_user.account_id, template_id: @template.id)
+
+      (id && scope.find_by(id: id)) ||
+        scope.where('created_at > ?', Time.at(exp) - PreviewToken::TTL - 600)
+             .where('preferences LIKE ?', "%#{nonce}%")
+             .order(:id).first
     end
 
     # Only an original template made by icodos_create_contract_template.
@@ -505,17 +599,20 @@ module Mcp
       original = Icodos::FilingHookController::Filing.copy_of(@template)
 
       if @template.external_id != marker
-        raise InvalidArguments,
-              "template #{@template.id} was not made by icodos_create_contract_template (it was made in the web " \
-              'interface, or it is a copy of one). Its filing folder and file name may belong to another ' \
-              'document. Create the template with icodos_create_contract_template.'
+        raise InvalidArguments.new(
+          "template #{@template.id} was not made by icodos_create_contract_template (it was made in the web " \
+          'interface, or it is a copy of one). Its filing folder and file name may belong to another document.',
+          code: 'template_not_original', hint: 'Create the template with icodos_create_contract_template.'
+        )
       end
 
       return unless original
 
-      raise InvalidArguments,
-            "template #{@template.id} is a copy of template #{original}, and its filing folder and file name belong " \
-            'to that one. Create a new template with icodos_create_contract_template.'
+      raise InvalidArguments.new(
+        "template #{@template.id} is a copy of template #{original}, and its filing folder and file name belong " \
+        'to that one.',
+        code: 'template_not_original', hint: 'Create a new template with icodos_create_contract_template.'
+      )
     end
 
     def ensure_not_fixed_term!
@@ -530,15 +627,16 @@ module Mcp
               'agreement, an amendment that sets or extends an end date)? Read the document to answer it.'
       end
 
-      raise InvalidArguments, FIXED_TERM_REFUSAL if declared == true
+      raise InvalidArguments.new(FIXED_TERM_REFUSAL, code: 'fixed_term_refused') if declared == true
 
       hit = fixed_term_hit
 
       return unless hit
 
-      raise InvalidArguments,
-            "#{FIXED_TERM_REFUSAL} (The template looks fixed-term: #{hit[:where]} contains #{hit[:match].inspect}. " \
-            'If that is wrong, the guard can only be lifted on the server.)'
+      raise InvalidArguments.new(
+        "#{FIXED_TERM_REFUSAL} (The template looks fixed-term: #{hit[:where]} contains #{hit[:match].inspect}.)",
+        code: 'fixed_term_refused', hint: 'If that is wrong, the guard can only be lifted on the server.'
+      )
     end
 
     def fixed_term_hit

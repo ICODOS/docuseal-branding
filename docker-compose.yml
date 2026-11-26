@@ -166,12 +166,12 @@ services:
       # are signed on paper for now. off lifts it. See FIXED_TERM_PATTERN in
       # contracts/send_contract_controller.rb.
       - ICODOS_CONTRACTS_FIXED_TERM_GUARD=${ICODOS_CONTRACTS_FIXED_TERM_GUARD:-on}
-      # Upstream MCP tools not offered to agents on this instance, because they
-      # carry none of the guards of the two ICODOS tools. See the constant
-      # DEFAULT_HIDDEN_TOOLS in contracts/zz_icodos_contracts.rb. Deliberately
-      # `-` and not `:-`: only an UNSET variable takes the default. To offer
-      # every upstream tool again, set ICODOS_MCP_HIDDEN_TOOLS=none in .env.
-      - ICODOS_MCP_HIDDEN_TOOLS=${ICODOS_MCP_HIDDEN_TOOLS-send_documents,create_template}
+      # The upstream MCP tools agents may use on this instance: an allowlist.
+      # Empty means the default, the three read-only tools named in
+      # DEFAULT_UPSTREAM_TOOLS in contracts/zz_icodos_contracts.rb; send_documents,
+      # create_template and any tool a later upstream version adds stay
+      # refused. `none` offers no upstream tool, `all` every one as shipped.
+      - ICODOS_MCP_UPSTREAM_TOOLS=${ICODOS_MCP_UPSTREAM_TOOLS:-}
       # SSO API key reveal. Off unless explicitly true; when off the upstream
       # password dialog is served unchanged.
       - ICODOS_SSO_REVEAL_ENABLED=${ICODOS_SSO_REVEAL_ENABLED:-false}

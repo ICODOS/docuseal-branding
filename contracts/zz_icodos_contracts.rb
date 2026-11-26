@@ -21,9 +21,9 @@
 # and `docker compose up -d`. They stop being advertised and stop being
 # routable. To remove the code as well, delete the whole "Phase E" mount block
 # from docker-compose.yml.
-# The hidden upstream tools are a separate switch, on purpose: see
-# IcodosContracts.hidden_tools. Turning the contract tools off does NOT bring
-# send_documents and create_template back.
+# The tool policy is a separate switch, on purpose: see
+# IcodosContracts.upstream_allowed. Turning the contract tools off does NOT
+# bring send_documents and create_template back.
 
 module IcodosContracts
   # Tool name -> controller. Resolved lazily by name because constants are not
@@ -34,27 +34,43 @@ module IcodosContracts
     'icodos_send_contract' => 'Mcp::IcodosSendContractController'
   }.freeze
 
-  # Upstream tools this instance does not offer to agents.
+  # THE TOOL POLICY (finding T1): which upstream tools agents may use here.
   #
-  # The two ICODOS tools carry guards: a preview before sending, employer-first
-  # order, a first signer inside the company, files read only from permitted
-  # SharePoint folders. Upstream's send_documents and create_template sat next
-  # to them with none of that. send_documents takes any template and any
-  # recipient and falls back to random signing order; create_template fetches
-  # whatever https address it is handed, from the server. An agent acting on an
-  # instruction smuggled into a document or an email had no reason to pick the
-  # guarded tool. Until 25 November 2026 the guards therefore protected only
-  # agents that chose to be protected.
+  # An allowlist, not a list of tools to hide. The two ICODOS tools carry
+  # guards: a preview bound to its confirmation, employer-first order, a first
+  # signer inside the company, files read only from permitted SharePoint
+  # folders. Upstream's send_documents and create_template sit next to them
+  # with none of that: send_documents takes any template and any recipient and
+  # falls back to random signing order; create_template fetches whatever https
+  # address it is handed, from the server. An agent acting on an instruction
+  # smuggled into a document or an email would simply use them.
+  #
+  # From 25 November 2026 those two were hidden by name. That left the door
+  # open the other way: a tool that a later upstream version adds would have
+  # been offered to agents the moment the image was bumped, unreviewed. Now an
+  # upstream tool is offered only when it is named here. The three allowed by
+  # default read and change nothing.
   #
   # Independent of ICODOS_CONTRACTS_ENABLED and of whether SharePoint is
   # reachable. enabled? turns false when the Graph certificate lapses or the
   # configuration breaks, and a broken certificate must not be what quietly
   # puts the unguarded tools back.
   #
-  #   ICODOS_MCP_HIDDEN_TOOLS unset          these two (the default)
-  #   ICODOS_MCP_HIDDEN_TOOLS=a,b            exactly those
-  #   ICODOS_MCP_HIDDEN_TOOLS=none           nothing hidden, upstream as shipped
-  DEFAULT_HIDDEN_TOOLS = %w[send_documents create_template].freeze
+  #   ICODOS_MCP_UPSTREAM_TOOLS unset or empty   the three below (the default)
+  #   ICODOS_MCP_UPSTREAM_TOOLS=a,b              exactly those upstream tools
+  #   ICODOS_MCP_UPSTREAM_TOOLS=none             no upstream tool
+  #   ICODOS_MCP_UPSTREAM_TOOLS=all              upstream as shipped, including
+  #                                              tools nobody here has reviewed
+  #
+  # The ICODOS tools are not part of the list: they are offered whenever
+  # ICODOS_CONTRACTS_ENABLED is true and SharePoint is usable.
+  DEFAULT_UPSTREAM_TOOLS = %w[search_templates load_template search_documents].freeze
+
+  # The upstream tools of DocuSeal 3.4.0, read and judged when the policy was
+  # written. Anything else upstream offers after a version bump is reported
+  # at boot as not reviewed; it stays refused unless named above.
+  REVIEWED_UPSTREAM_TOOLS = %w[search_templates load_template create_template send_documents
+                               search_documents].freeze
 
   module_function
 
@@ -64,17 +80,33 @@ module IcodosContracts
     false
   end
 
-  def hidden_tools
-    raw = ENV['ICODOS_MCP_HIDDEN_TOOLS']
+  # :all, or the list of upstream tool names agents may use.
+  def upstream_allowed
+    raw = ENV['ICODOS_MCP_UPSTREAM_TOOLS'].to_s.strip
 
-    return DEFAULT_HIDDEN_TOOLS if raw.nil? || raw.strip.empty?
-    return [] if raw.strip.casecmp('none').zero?
+    return DEFAULT_UPSTREAM_TOOLS if raw.empty?
+    return [] if raw.casecmp('none').zero?
+    return :all if raw.casecmp('all').zero?
 
     raw.split(',').map(&:strip).reject(&:empty?)
   end
 
-  def hidden?(name)
-    hidden_tools.include?(name.to_s)
+  def upstream_tools
+    McpController::TOOL_CONTROLLERS.keys.map(&:to_s)
+  end
+
+  # True for an upstream tool this instance does not offer. A name that is
+  # neither upstream nor ICODOS is not refused here; it reaches upstream and
+  # gets upstream's own "tool not found".
+  def refused?(name)
+    name = name.to_s
+    allowed = upstream_allowed
+
+    upstream_tools.include?(name) && allowed != :all && !allowed.include?(name)
+  end
+
+  def refused_tools
+    upstream_tools.select { |name| refused?(name) }
   end
 
   # The controller for an ICODOS tool name, or nil: when the feature is off,
@@ -107,7 +139,7 @@ module IcodosContracts
     []
   end
 
-  # Prepended to McpController. Decides, for tools/call, between a hidden
+  # Prepended to McpController. Decides, for tools/call, between a refused
   # upstream tool, an ICODOS tool and everything else. Everything else falls
   # straight through to upstream — including malformed bodies, so upstream
   # keeps ownership of its -32700 parse error.
@@ -137,7 +169,7 @@ module IcodosContracts
 
       # First, and outside every rescue: nothing that goes wrong further down
       # may end in `super` for a tool that is meant to be unreachable.
-      if IcodosContracts.hidden?(name)
+      if IcodosContracts.refused?(name)
         request.request_parameters = body
 
         return Mcp::ProtocolController.dispatch(:icodos_hidden_tool, request, response)
@@ -162,29 +194,189 @@ module IcodosContracts
   end
 
   # Prepended to Mcp::ProtocolController: what tools/list shows, and the answer
-  # for a hidden tool. Both run behind McpBaseController's authentication, like
-  # every other action of that controller.
+  # for a refused tool. Both run behind McpBaseController's authentication,
+  # like every other action of that controller.
   module ToolsList
     def tools_list
-      upstream = McpController::TOOLS.reject { |tool| IcodosContracts.hidden?(tool[:name]) }
+      upstream = McpController::TOOLS.reject { |tool| IcodosContracts.refused?(tool[:name]) }
 
       render_result(tools: upstream + IcodosContracts.schemas)
     end
 
-    # A hidden tool is not in tools/list, but a client may still hold an older
-    # list. It gets a tool error that says what to use instead, not a protocol
-    # error it can only guess at.
+    # A refused tool is not in tools/list, but a client may still hold an
+    # older list. It gets a tool error that says what to use instead, not a
+    # protocol error it can only guess at.
     def icodos_hidden_tool
       name = mcp_body.dig('params', 'name')
 
-      Rails.logger.info("[icodos-contracts] refused hidden tool #{name} user_id=#{current_user&.id}")
+      Rails.logger.info("[icodos-contracts] refused tool #{name} user_id=#{current_user&.id}")
 
-      render_tool_error(
-        "#{name} is switched off on this instance. For contracts use icodos_create_contract_template, which " \
-        'reads the PDF from the SharePoint contracts library, and icodos_send_contract, which previews first ' \
-        'and sends employer first. Anything those two do not cover is done in the DocuSeal web interface.'
+      render_result(
+        content: [{ type: 'text', text: IcodosToolErrors.payload(
+          'tool_refused',
+          "#{name} is switched off on this instance.",
+          retryable: false,
+          hint: 'For contracts use icodos_create_contract_template, which reads the PDF from the SharePoint ' \
+                'contracts library, and icodos_send_contract, which previews first and sends employer first. ' \
+                'Anything those two do not cover is done in the DocuSeal web interface.',
+          request_id: request.request_id
+        ).to_json }],
+        isError: true
       )
     end
+  end
+end
+
+# Structured errors of the ICODOS tools (finding T5).
+#
+# Until November 2026 a failing tool answered with a sentence, or, for any
+# exception nobody had thought of, a bare HTTP 500, which Claude's connector
+# shows as "Bad Gateway". An agent could not tell "fix your arguments" from
+# "try again in a minute" from "something may already have been sent", and a
+# bare 500 invited it to try a different tool. Every error of the two tools
+# now answers as a tool error whose text is one JSON object:
+#
+#   {"error":"preview_expired","message":"...","retryable":false,
+#    "hint":"Make a new preview and show it to the requester.",
+#    "done":"nothing","request_id":"..."}
+#
+# error      a stable code; the list is in the README
+# retryable  true only when the SAME call may simply be repeated later
+# done       what had already happened when the error came: "nothing", or a
+#            sentence saying what exists now and what must not be repeated
+# request_id matches the log and the audit record
+#
+# Included by both tool controllers. The handlers are declared from the most
+# general to the most specific, because Rails tries the last declared first.
+module IcodosToolErrors
+  class ToolError < StandardError
+    attr_reader :code, :retryable, :hint
+
+    def initialize(message = nil, code: 'invalid_arguments', retryable: false, hint: nil)
+      super(message)
+      @code = code
+      @retryable = retryable
+      @hint = hint
+    end
+  end
+
+  # Graph statuses that say "later", not "never".
+  RETRYABLE_GRAPH_STATUSES = [408, 423, 429, 500, 502, 503, 504].freeze
+
+  def self.payload(code, message, retryable:, hint: nil, done: 'nothing', request_id: nil)
+    { error: code, message: message.to_s, retryable: retryable, hint: hint, done: done,
+      request_id: request_id }.compact
+  end
+
+  def self.included(base)
+    base.rescue_from StandardError, with: :icodos_unexpected_error
+    base.rescue_from ActiveRecord::RecordInvalid, ActiveRecord::RecordNotSaved, with: :icodos_save_error
+    base.rescue_from Faraday::Error, with: :icodos_network_error
+    base.rescue_from IcodosGraph::Error, with: :icodos_graph_error
+    base.rescue_from ToolError, with: :icodos_tool_error
+    base.rescue_from ActiveRecord::RecordNotFound, with: :icodos_not_found
+    # Upstream's own answer (McpBaseController), restated so that the
+    # catch-all above does not take it over.
+    base.rescue_from CanCan::AccessDenied, with: :icodos_access_denied
+  end
+
+  private
+
+  def icodos_tool_name
+    self.class::SCHEMA[:name]
+  rescue StandardError
+    self.class.name
+  end
+
+  # What had already happened. A tool sets @icodos_done once something
+  # exists that a repeated call must not create again.
+  def icodos_done
+    @icodos_done || 'nothing'
+  end
+
+  def icodos_error(code, message, retryable:, hint: nil)
+    Rails.logger.info("[icodos-contracts] #{icodos_tool_name} error=#{code} retryable=#{retryable} " \
+                      "done=#{icodos_done == 'nothing' ? 'nothing' : 'something'} user_id=#{current_user&.id}")
+
+    render_result(content: [{ type: 'text', text: IcodosToolErrors.payload(
+      code, message, retryable: retryable, hint: hint, done: icodos_done, request_id: request.request_id
+    ).to_json }], isError: true)
+  end
+
+  def icodos_tool_error(error)
+    icodos_error(error.code, error.message, retryable: error.retryable, hint: error.hint)
+  end
+
+  def icodos_not_found(_error)
+    icodos_error('not_found', 'No such template or submission in this account.',
+                 retryable: false, hint: 'Check the id with search_templates or search_documents.')
+  end
+
+  def icodos_access_denied(_error)
+    render_error(-32_603, 'Forbidden', status: :forbidden)
+  end
+
+  # rubocop:disable Metrics
+  def icodos_graph_error(error)
+    Rails.logger.error("[icodos-contracts] #{icodos_tool_name}: #{error.class} #{error.message}")
+
+    status = error.respond_to?(:status) ? error.status.to_i : 0
+
+    case error
+    when IcodosGraph::PathError
+      icodos_error('path_refused', error.message,
+                   retryable: false,
+                   hint: 'Paths are relative to the document library root and must lie inside the permitted ' \
+                         'folders. Ask the requester for the exact path.')
+    when IcodosGraph::ConfigError, IcodosGraph::AuthError
+      icodos_error('sharepoint_config', "SharePoint access is not working on the server: #{error.message}",
+                   retryable: false,
+                   hint: 'Not fixable by the caller. Tell the requester; an administrator must check the Graph ' \
+                         'certificate and app registration.')
+    else
+      if status == 404
+        icodos_error('sharepoint_not_found', "SharePoint: #{error.message}",
+                     retryable: false, hint: 'The file or folder is not there. Check the path with the requester.')
+      elsif RETRYABLE_GRAPH_STATUSES.include?(status)
+        icodos_error('sharepoint_unavailable', "SharePoint: #{error.message}",
+                     retryable: true, hint: 'SharePoint is busy or briefly unavailable. Retry the same call in a minute.')
+      else
+        icodos_error('sharepoint_error', "SharePoint: #{error.message}", retryable: false)
+      end
+    end
+  end
+  # rubocop:enable Metrics
+
+  def icodos_network_error(error)
+    Rails.logger.error("[icodos-contracts] #{icodos_tool_name}: #{error.class} #{error.message}")
+
+    icodos_error('sharepoint_unreachable',
+                 "SharePoint could not be reached (#{error.class.name.demodulize}: #{error.message}).",
+                 retryable: true, hint: 'A network failure, not a problem with the arguments. Retry the same ' \
+                                        'call in a minute.')
+  end
+
+  def icodos_save_error(error)
+    Rails.logger.error("[icodos-contracts] #{icodos_tool_name}: #{error.class} #{error.message}")
+
+    icodos_error('save_failed', "DocuSeal could not save the record: #{error.message}",
+                 retryable: false, hint: 'Not a network failure. Report the request_id.')
+  end
+
+  # Anything nobody anticipated. Two exceptions are left alone: CanCan's
+  # check that every action authorized (a security net, raised after the
+  # response, which must stay an error), and anything raised after a
+  # response was already rendered.
+  def icodos_unexpected_error(error)
+    raise error if error.is_a?(CanCan::AuthorizationNotPerformed) || performed?
+
+    Rails.logger.error("[icodos-contracts] #{icodos_tool_name}: unexpected #{error.class}: #{error.message} " \
+                       "at #{Array(error.backtrace).first(3).join(' | ')}")
+
+    icodos_error('internal_error', "The tool failed unexpectedly (#{error.class.name}).",
+                 retryable: false,
+                 hint: 'Do not retry with another tool. Look at "done" before trying again, and report the ' \
+                       'request_id.')
   end
 end
 
@@ -368,7 +560,7 @@ Rails.application.config.to_prepare do
     # twice: the ICODOS tools are not registered, AND the hidden upstream tools
     # are reachable again, because the code that hides them did not attach.
     Rails.logger.error("[icodos-contracts] could not attach to the MCP controllers (#{e.class}: #{e.message}). " \
-                       'Phase E tools are NOT registered and NO upstream tool is hidden.')
+                       'Phase E tools are NOT registered and NO upstream tool is refused.')
   end
 end
 
@@ -380,8 +572,12 @@ Rails.application.config.after_initialize do
     attached = McpController.ancestors.include?(IcodosContracts::Dispatch) &&
                Mcp::ProtocolController.ancestors.include?(IcodosContracts::ToolsList)
 
-    hidden = IcodosContracts.hidden_tools
-    unknown = hidden - McpController::TOOLS.map { |tool| tool[:name].to_s }
+    allowed = IcodosContracts.upstream_allowed
+    upstream = IcodosContracts.upstream_tools
+    refused = IcodosContracts.refused_tools
+    offered = upstream - refused
+    unknown = allowed == :all ? [] : allowed - upstream
+    unreviewed = upstream - IcodosContracts::REVIEWED_UPSTREAM_TOOLS
 
     audit = begin
       FileUtils.mkdir_p(IcodosAudit.dir, mode: 0o700)
@@ -391,20 +587,33 @@ Rails.application.config.after_initialize do
     end
     identity = Mcp::McpBaseController.ancestors.include?(IcodosAudit::Identity)
 
-    Rails.logger.info("[icodos-contracts] tool policy: hidden=#{hidden.empty? ? 'none' : hidden.join(',')} " \
+    Rails.logger.info("[icodos-contracts] tool policy: upstream_offered=#{offered.empty? ? 'none' : offered.join(',')} " \
+                      "upstream_refused=#{refused.empty? ? 'none' : refused.join(',')} " \
                       "hooks=#{attached ? 'attached' : 'NOT ATTACHED'} " \
                       "audit=#{audit} audit_identity=#{identity ? 'attached' : 'missing'}")
 
     if unknown.any?
       # A typo in the variable, or upstream renamed a tool. Either way the tool
-      # that was meant to be hidden is not.
-      Rails.logger.error("[icodos-contracts] hidden tool name(s) #{unknown.join(', ')} match no upstream tool; " \
-                         "upstream offers #{McpController::TOOLS.map { |tool| tool[:name] }.join(', ')}")
+      # that was meant to be offered is not; nothing is offered by mistake.
+      Rails.logger.error("[icodos-contracts] ICODOS_MCP_UPSTREAM_TOOLS names #{unknown.join(', ')}, which match no " \
+                         "upstream tool; upstream offers #{upstream.join(', ')}")
+    end
+
+    if unreviewed.any?
+      # A version bump brought tools nobody here has read. Refused unless the
+      # variable names them (or says all).
+      Rails.logger.warn("[icodos-contracts] upstream tool(s) not reviewed for this instance: #{unreviewed.join(', ')}; " \
+                        "#{(unreviewed & offered).any? ? 'OFFERED because ICODOS_MCP_UPSTREAM_TOOLS allows them' : 'refused'}")
+    end
+
+    if ENV.key?('ICODOS_MCP_HIDDEN_TOOLS')
+      Rails.logger.error('[icodos-contracts] ICODOS_MCP_HIDDEN_TOOLS is no longer read (since the T1 tool policy); ' \
+                         'use ICODOS_MCP_UPSTREAM_TOOLS, an allowlist')
     end
 
     unless attached
       Rails.logger.error('[icodos-contracts] the MCP hooks are NOT attached: ICODOS tools would answer as unknown ' \
-                         'and hidden upstream tools are reachable')
+                         'and refused upstream tools are reachable')
     end
 
     if IcodosContracts.enabled?

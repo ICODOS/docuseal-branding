@@ -129,9 +129,21 @@ module Mcp
     MAX_NAME_LENGTH = 250
     MAX_SOURCE_BYTES = 3 * 1024 * 1024
 
-    # Raised for anything the caller could fix by changing its arguments. Kept
-    # distinct from Graph and DocuSeal failures so the message can say which.
-    class InvalidArguments < StandardError; end
+    # An identical call within this window returns the template the first
+    # one made instead of a second copy (finding T6). Identical means the same
+    # user and the same arguments, compared as canonical JSON.
+    REUSE_WINDOW = 24 * 3600
+    CREATE_DIGEST_KEY = 'icodos_create_digest'
+    # While one call creates, an identical one waits instead of racing it.
+    IN_FLIGHT_TTL = 600
+    FIELD_PLACEHOLDER = 'pending-attachment'
+
+    # Errors answer as structured tool errors (IcodosToolErrors, finding T5).
+    # InvalidArguments is anything the caller could fix by changing its
+    # arguments; its code defaults to invalid_arguments.
+    include ::IcodosToolErrors
+
+    InvalidArguments = ::IcodosToolErrors::ToolError
 
     # rubocop:disable Metrics
     def call
@@ -168,7 +180,9 @@ module Mcp
 
       authorize!(:create, @template)
 
-      return render_tool_error('Phase E is not enabled on this instance') unless IcodosGraph.enabled?
+      unless IcodosGraph.enabled?
+        raise InvalidArguments.new('the contract tools are not enabled on this instance', code: 'disabled')
+      end
 
       name = mcp_params['name'].to_s.strip
       folder_name = mcp_params['folder_name'].to_s.strip
@@ -191,54 +205,66 @@ module Mcp
       end
 
       submitters = roles.map { |role| { 'name' => role, 'uuid' => SecureRandom.uuid } }
+      raw_fields = Array.wrap(mcp_params['fields'])
 
-      # Before the download and before anything is saved, so a refusal costs
-      # nothing and leaves nothing behind.
-      ensure_every_role_signs!(Array.wrap(mcp_params['fields']), submitters)
+      # Every argument is checked before the download and before anything is
+      # saved, so a refusal costs nothing and leaves nothing behind. Fields
+      # used to be checked after the template was saved with the contract
+      # attached, and each failed attempt left one orphan template holding
+      # the PDF (finding T6).
+      ensure_every_role_signs!(raw_fields, submitters)
+      fields = build_fields!(raw_fields, submitters, FIELD_PLACEHOLDER)
 
-      # Waits out OneDrive sync rather than failing on a 404 the caller would
-      # have to interpret. See IcodosGraph#download_when_synced.
-      bytes = IcodosGraph.download_when_synced(source_path)
+      digest = create_digest
+      existing = earlier_identical(digest)
 
-      raise InvalidArguments, "#{source_path} is empty" if bytes.empty?
+      return render_created(existing, reused: true) if existing
 
-      # The signed copy is the draft plus signatures and the audit trail, and
-      # it is filed with Graph's simple upload, which takes 4 MiB. A larger
-      # draft used to be accepted (up to 32 MiB) and its signed copy could
-      # then never be filed. Production drafts are well under 2 MB.
-      if bytes.bytesize > MAX_SOURCE_BYTES
-        raise InvalidArguments,
-              "#{source_path} is #{(bytes.bytesize / 1_048_576.0).round(1)} MB. Drafts are limited to " \
-              "#{MAX_SOURCE_BYTES / 1_048_576} MB so that the signed copy can be filed in SharePoint; reduce " \
-              'the file (images, embedded fonts) and try again.'
+      create_once(digest) do
+        # Waits out OneDrive sync rather than failing on a 404 the caller
+        # would have to interpret. See IcodosGraph#download_when_synced.
+        bytes = IcodosGraph.download_when_synced(source_path)
+
+        check_source!(bytes, source_path, fields)
+
+        @template.assign_attributes(name: name, submitters: submitters,
+                                    preferences: (@template.preferences || {}).merge(CREATE_DIGEST_KEY => digest))
+
+        build!(bytes, source_path, fields, filing_folder, folder_name)
+
+        @icodos_done = "template #{@template.id} created; do not create it again"
+
+        WebhookUrls.enqueue_events(@template, 'template.created')
+        SearchEntries.enqueue_reindex(@template)
+
+        render_created(@template)
       end
+    end
+    # rubocop:enable Metrics
 
-      # Cheap insurance against a .docx passed by mistake, or a file OneDrive
-      # has only partly written. Without it the template is created from
-      # whatever arrived and the problem surfaces at signature time.
-      unless bytes[0, 5].to_s.b == '%PDF-'.b
-        raise InvalidArguments,
-              "#{source_path} does not look like a PDF (it begins #{bytes[0, 8].to_s.inspect}). " \
-              'Pass the PDF, not the .docx, and make sure OneDrive has finished writing it.'
-      end
+    private
 
-      @template.assign_attributes(name: name, submitters: submitters)
+    # Saves the template, attaches the PDF and sets fields and preferences.
+    # Whatever fails on the way, the half-made template is removed again.
+    # rubocop:disable Metrics
+    def build!(bytes, source_path, fields, filing_folder, folder_name)
       @template.save!
 
       documents = attach_document!(@template, bytes, File.basename(source_path))
 
-      # One PDF per contract. Multiple documents would make the areas ambiguous,
-      # since a caller cannot know which attachment its coordinates refer to.
+      # One PDF per contract. Multiple documents would make the areas
+      # ambiguous, since a caller cannot know which attachment its
+      # coordinates refer to.
       raise InvalidArguments, "expected one document, got #{documents.length}" unless documents.length == 1
 
       attachment_uuid = documents.first.uuid
 
-      fields = build_fields!(Array.wrap(mcp_params['fields']), submitters, attachment_uuid)
+      fields.each { |field| field['areas'].each { |area| area['attachment_uuid'] = attachment_uuid } }
 
       preferences = (@template.preferences || {}).merge(
         # Set here so that EVERY send path preserves order, including upstream
-        # send_documents, which has no order parameter and otherwise falls back
-        # to 'random'.
+        # send_documents, which has no order parameter and otherwise falls
+        # back to 'random'.
         'submitters_order' => 'preserved',
         'icodos_filing_folder' => filing_folder,
         'icodos_source_path' => source_path,
@@ -248,9 +274,9 @@ module Mcp
         'icodos_template_id' => @template.id
       )
 
-      # FilenameUtils.basename(blob[:filename]) is how upstream names documents
-      # since 3.3.6, at every site that used to call filename.base. Kept in step
-      # so a document reads the same whichever path created it.
+      # FilenameUtils.basename(blob[:filename]) is how upstream names
+      # documents since 3.3.6, at every site that used to call filename.base.
+      # Kept in step so a document reads the same whichever path created it.
       schema = documents.map do |doc|
         { 'attachment_uuid' => doc.uuid, 'name' => FilenameUtils.basename(doc.blob[:filename]) }
       end
@@ -261,37 +287,143 @@ module Mcp
         folder: folder_name.present? ? TemplateFolders.find_or_create_by_name(current_user, folder_name) : @template.folder,
         preferences: preferences
       )
-
-      WebhookUrls.enqueue_events(@template, 'template.created')
-      SearchEntries.enqueue_reindex(@template)
-
-      render_tool_result(
-        id: @template.id,
-        name: @template.name,
-        external_id: @template.external_id,
-        folder: @template.folder&.name,
-        roles: roles,
-        fields: fields.length,
-        filing_folder: filing_folder,
-        edit_url: edit_template_url(@template)
-      )
-    rescue InvalidArguments, IcodosGraph::PathError => e
-      render_tool_error(e.message)
-    rescue IcodosGraph::Error => e
-      # Graph and SharePoint failures name themselves well; passing the message
-      # through is what lets the caller tell "wrong path" from "lost access".
-      Rails.logger.error("[icodos-contracts] create_contract_template: #{e.class} #{e.message}")
-      render_tool_error("SharePoint: #{e.message}")
-    rescue Faraday::Error => e
-      # Timeouts, DNS and TLS failures on the way to Entra, Graph or SharePoint
-      # are Faraday's, not IcodosGraph's, and would otherwise be a bare 500.
-      Rails.logger.error("[icodos-contracts] create_contract_template: #{e.class} #{e.message}")
-      render_tool_error("SharePoint could not be reached (#{e.class.name.demodulize}: #{e.message}). " \
-                        'This is a network failure, not a problem with the arguments; retry in a minute.')
+    rescue StandardError
+      discard_template!
+      raise
     end
     # rubocop:enable Metrics
 
-    private
+    def discard_template!
+      return unless @template&.persisted?
+
+      id = @template.id
+      @template.destroy!
+      @icodos_done = 'nothing'
+    rescue StandardError => e
+      Rails.logger.error("[icodos-contracts] create_contract_template: could not remove half-made template #{id} " \
+                         "(#{e.class}: #{e.message})")
+
+      @icodos_done = "unknown: a half-made template #{id} may exist; archive it in the web interface"
+    end
+
+    def render_created(template, reused: false)
+      result = {
+        id: template.id,
+        name: template.name,
+        external_id: template.external_id,
+        folder: template.folder&.name,
+        roles: Array.wrap(template.submitters).map { |s| s['name'] },
+        fields: Array.wrap(template.fields).length,
+        filing_folder: template.preferences.to_h['icodos_filing_folder'],
+        edit_url: edit_template_url(template)
+      }
+
+      if reused
+        Rails.logger.info("[icodos-contracts] create_contract_template reused template=#{template.id} " \
+                          "user_id=#{current_user.id}")
+
+        result[:reused] = true
+        result[:note] = "An identical call created this template at #{template.created_at.utc.iso8601}; it was " \
+                        'not created again. To create a second one on purpose, change the name, or archive ' \
+                        'this one first.'
+      end
+
+      render_tool_result(result)
+    end
+
+    # The same user and the same arguments, as canonical JSON.
+    def create_digest
+      IcodosAudit.digest('user_id' => current_user.id, 'arguments' => mcp_params.to_h)
+    end
+
+    def earlier_identical(digest)
+      Template.where(account_id: current_user.account_id, author_id: current_user.id,
+                     external_id: PHASE_E_MARKER, archived_at: nil)
+              .where('created_at > ?', Time.current - REUSE_WINDOW)
+              .where('preferences LIKE ?', "%#{digest}%")
+              .order(:id).last
+    end
+
+    # One identical call at a time. A client that times out during the slow
+    # SharePoint download and calls again would otherwise race the first call
+    # into a second template. Without Redis the call goes ahead: creating a
+    # template sends nothing, and the digest still finds it afterwards.
+    def create_once(digest)
+      key = "icodos:create_contract_template:#{digest}"
+
+      held =
+        begin
+          ::Sidekiq.redis { |c| c.call('SET', key, current_user.id.to_s, 'NX', 'EX', IN_FLIGHT_TTL) } == 'OK'
+        rescue StandardError => e
+          Rails.logger.error("[icodos-contracts] create_contract_template: in-flight store unreachable " \
+                             "(#{e.class}: #{e.message}); going ahead")
+          nil
+        end
+
+      if held == false
+        raise InvalidArguments.new(
+          'an identical call is creating this template right now. Nothing was created by this call.',
+          code: 'in_progress', retryable: true,
+          hint: 'Wait half a minute and repeat the same call; it then answers with that template.'
+        )
+      end
+
+      begin
+        yield
+      ensure
+        begin
+          ::Sidekiq.redis { |c| c.call('DEL', key) } if held
+        rescue StandardError
+          nil
+        end
+      end
+    end
+
+    # The downloaded file, before anything is saved: not empty, not too big
+    # to file once signed, a PDF, and long enough for every field.
+    # rubocop:disable Metrics
+    def check_source!(bytes, source_path, fields)
+      raise InvalidArguments.new("#{source_path} is empty", code: 'invalid_pdf') if bytes.empty?
+
+      # The signed copy is the draft plus signatures and the audit trail, and
+      # it is filed with Graph's simple upload, which takes 4 MiB. A larger
+      # draft used to be accepted (up to 32 MiB) and its signed copy could
+      # then never be filed. Production drafts are well under 2 MB.
+      if bytes.bytesize > MAX_SOURCE_BYTES
+        raise InvalidArguments.new(
+          "#{source_path} is #{(bytes.bytesize / 1_048_576.0).round(1)} MB. Drafts are limited to " \
+          "#{MAX_SOURCE_BYTES / 1_048_576} MB so that the signed copy can be filed in SharePoint.",
+          code: 'invalid_pdf', hint: 'Reduce the file (images, embedded fonts) and try again.'
+        )
+      end
+
+      # Cheap insurance against a .docx passed by mistake, or a file OneDrive
+      # has only partly written. Without it the template is created from
+      # whatever arrived and the problem surfaces at signature time.
+      unless bytes[0, 5].to_s.b == '%PDF-'.b
+        raise InvalidArguments.new(
+          "#{source_path} does not look like a PDF (it begins #{bytes[0, 8].to_s.inspect}).",
+          code: 'invalid_pdf', hint: 'Pass the PDF, not the .docx, and make sure OneDrive has finished writing it.'
+        )
+      end
+
+      pages = begin
+        HexaPDF::Document.new(io: StringIO.new(bytes)).pages.count
+      rescue HexaPDF::Error => e
+        raise InvalidArguments.new("#{source_path} could not be read as a PDF (#{e.message}).", code: 'invalid_pdf')
+      end
+
+      beyond = fields.flat_map { |f| f['areas'].map { |a| [f['name'], a['page']] } }.select { |_, page| page >= pages }
+
+      return if beyond.empty?
+
+      raise InvalidArguments.new(
+        "#{source_path} has #{pages} page(s) (numbered 0 to #{pages - 1}), but " \
+        "#{beyond.map { |name, page| "#{name} is on page #{page}" }.uniq.join(', ')}.",
+        hint: 'Page numbers are zero-based.'
+      )
+    end
+    # rubocop:enable Metrics
 
     def attach_document!(template, bytes, filename)
       tempfile = Tempfile.new

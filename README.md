@@ -574,17 +574,21 @@ Escalating (default)  schedule [72, 168], then_every_hours 24
 
 Stored per submission in `submissions.preferences`, with an account default in an `AccountConfig`. No migration.
 
+**The account default is anchored at the time it is saved.** The stored value carries `activated_at` and the defaults before it, and a submission without its own policy follows the default that was in force when it was created. Until November 2026 the bare policy was stored and read afresh by every sweep, so one click on the settings page moved every pending signer to the new schedule, and "off" deleted the record; the page said "for new documents" all along. The page now saves with a button rather than on click.
+
 **Order awareness matters most.** With `submitters_order = 'preserved'`, only the signer whose turn it is gets reminded. Chasing an employee before ICODOS has countersigned is worse than not reminding at all.
 
-**Caps no policy can override:** one per person per day, never within an hour of a previous send, 30 per signer, 200 per sweep. A wrong policy must send fewer emails than intended, never more.
+**Caps no policy can override:** one per person per day, never within an hour of a previous send, 30 per signer, 200 per sweep. A wrong policy must send fewer emails than intended, never more. The daily cap is also kept in Redis, claimed before each email and independent of the record in the database: a reminder whose email or whose record fails is not tried again for 20 hours, where it used to be tried at every sweep.
+
+**Escalation ends the reminders.** The reminder that reaches `escalate_after` unanswered goes out with a note to the sender saying that no further reminders follow, and none do. Until November 2026 they continued up to the stop count. "Once a week, until they sign" therefore no longer escalates.
+
+**Viewers are not reminded, and resends count.** A role that owns no field is a viewer upstream and is never asked to sign; in signing order a viewer that came first used to be reminded instead of the signer whose turn it was. An invitation sent again by hand ("Resend", or the API; upstream records each as `send_email`) counts as a reminder for spacing and totals, so the schedule does not follow it minutes later.
 
 ### The sweep
 
-Host cron every 15 minutes, enqueuing through `rails runner`. Not a self-rescheduling Sidekiq job: that needs no gem but dies silently if Redis is flushed, and a reminder engine that quietly stops is the exact failure this work exists to fix.
+Every 15 minutes from `docuseal-reminders.timer` on the host (systemd, kept in the private operations repository and installed from there), through `rails runner`. Not a self-rescheduling Sidekiq job: that needs no gem but dies silently if Redis is flushed, and a reminder engine that quietly stops is the exact failure this work exists to fix.
 
-A Redis lock stops two sweeps double-sending. A heartbeat (`last_swept_at`) makes a dead cron loud — the smoke check fails on it and the settings page says so in red.
-
-**The cron entry lives on the host, outside this repo and outside git.** It will be lost on a host rebuild. See the admin runbook.
+A Redis lock stops two sweeps double-sending. Each reminder is sent on its own: one address the mail relay rejects is counted as an error of that sweep, and the others are still reminded (it used to abort the sweep for everyone, every 15 minutes, with the heartbeat still green). A heartbeat (`last_swept_at`) makes a dead timer loud — the smoke check fails on it, the settings page says so in red, and the host's health job alerts on a sweep that is late or reported errors.
 
 ### Two defects worth remembering
 

@@ -48,11 +48,11 @@ module IcodosReminderCheck
     step('sweep heartbeat is fresh') do
       last = IcodosReminderSweep.last_swept_at
 
-      raise 'no sweep has ever run — is the host cron installed?' if last.nil?
+      raise 'no sweep has ever run — is docuseal-reminders.timer active on the host?' if last.nil?
 
       age = ((Time.current - last) / 60).round
 
-      raise "the last sweep was #{age} minutes ago; the cron is probably gone" if age > 120
+      raise "the last sweep was #{age} minutes ago; docuseal-reminders.timer has probably stopped" if age > 120
 
       "#{age} min ago"
     end

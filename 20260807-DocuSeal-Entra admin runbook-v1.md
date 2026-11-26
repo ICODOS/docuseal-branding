@@ -472,23 +472,18 @@ ssh root@31.70.107.24 'cd /opt/docuseal && docker compose logs app --since 60s |
 
 Overlay code lives in `/opt/docuseal/reminders` and is published in the branding repo. Design and research are in `20260815-DocuSeal-Reminder engine design-v1.md`.
 
-### The scheduled task is NOT in git
+### The scheduled task
 
-This is the part that will be lost on a host rebuild:
+Since 25 November 2026 the sweep runs from `docuseal-reminders.timer`, every 15 minutes, which the private operations repository installs together with its script (`/usr/local/sbin/docuseal-reminder-sweep`). The root crontab entry it replaced is gone; a host rebuilt from the operations repository gets the timer back.
 
 ```bash
-crontab -l | grep -A3 'reminder sweep'
+systemctl list-timers docuseal-reminders.timer
+journalctl -u docuseal-reminders -n 20
 ```
 
-It should read:
+The script keeps the log at `/var/log/icodos-reminders.log` and filters every line with `redis://` out of it. That filter is not decoration: every run boots Rails, and on boot Sidekiq logs the options it connects to Redis with, URL and password included; the old cron entry put the Redis password into this log 8,135 times before it was noticed on 25 November 2026. The log is mode 0600 and rotated weekly by `/etc/logrotate.d/icodos-reminders`; it also holds signer addresses, so keep it that way.
 
-```
-*/15 * * * * cd /opt/docuseal && /usr/bin/docker compose exec -T -w /app app rails runner "IcodosReminderSweep.call" 2>&1 | grep -v "redis://" >> /var/log/icodos-reminders.log
-```
-
-The `grep -v "redis://"` is not decoration. Every run boots Rails, and on boot Sidekiq logs the options it connects to Redis with, URL and password included. Appended every 15 minutes, that put the Redis password into this log 8,135 times before it was noticed on 25 November 2026. The log is mode 0600 and rotated weekly by `/etc/logrotate.d/icodos-reminders`; it also holds signer addresses, so keep it that way.
-
-If it is missing, reminders silently stop. The settings page shows a red warning after two hours without a check, and the smoke check fails — but only if someone looks.
+If the timer stops, the host's health job alerts within half an hour, the settings page shows a red warning after two hours without a sweep, and the smoke check fails.
 
 ### Turning it on and off
 
@@ -518,13 +513,15 @@ tail -20 /var/log/icodos-reminders.log
 | `enabled, LIVE` / `enabled, DRY RUN` | mode, at boot |
 | `sweep sent: 0 due` | ran, nothing was due — the normal quiet case |
 | `SENT submission=N to=…` | a reminder was emailed |
-| `ESCALATED submission=N to=…` | the sender was told instead; the signer is now left alone |
+| `ESCALATED submission=N to=…` | the sender was told; no further reminders go to that signer |
+| `reminder failed submission=N to=…` | that one email failed (for example the relay rejected the address); the others in the sweep went out, and this signer is not tried again for 20 hours |
+| `held submission=N to=…` | a reminder or a failed attempt to this signer is less than 20 hours old (the Redis cap) |
 | `WOULD SEND …` | dry run only |
 | `sweep already running, skipping` | the Redis lock held; normal if two sweeps overlap, suspicious if constant |
 
 ### Where the settings are
 
-`/settings/notifications` → *Sign Request Email Reminders*. Four choices, nothing else. Per-document schedules, stop-dates and deadline anchoring are set through the MCP tool, not the page — a date cannot be an account-wide default.
+`/settings/notifications` → *Sign Request Email Reminders*. Four choices and a Save button, nothing else. A saved choice applies to documents sent from then on; documents already sent keep the schedule they were sent with. Per-document schedules, stop-dates and deadline anchoring are set through the MCP tool, not the page — a date cannot be an account-wide default.
 
 The page shows red text only when reminders are **not** reaching anyone: test mode, a stalled scheduler, or the engine switched off. Silence there means it is working.
 

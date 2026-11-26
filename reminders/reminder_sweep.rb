@@ -12,15 +12,27 @@
 # DRY RUN IS THE DEFAULT. Sending needs ICODOS_REMINDERS_DRY_RUN=false set
 # explicitly, so a half-finished deployment cannot start emailing employees.
 #
-# Triggered by host cron rather than a self-rescheduling job: a chain of
+# Triggered every 15 minutes by the host's docuseal-reminders.timer (systemd,
+# operations repository) rather than a self-rescheduling job: a chain of
 # perform_in calls dies silently if Redis is flushed, and a reminder engine that
-# quietly stops is the exact failure this work exists to fix. Cron is visible in
-# crontab and its death is detectable via the heartbeat below.
+# quietly stops is the exact failure this work exists to fix. The timer is
+# visible in `systemctl list-timers`, its runs in the journal, and its death is
+# detectable via the heartbeat below and the host's health job.
 
 module IcodosReminderSweep
   LOCK_KEY = 'icodos_reminders:sweep:lock'
   HEARTBEAT_KEY = 'icodos_reminders:sweep:last_swept_at'
   LOCK_TTL = 300
+
+  # One reminder per signer per 20 hours, recorded in Redis BEFORE the email
+  # is sent and independent of the schedule's own bookkeeping in the
+  # database. If the email fails, or the record after it does, the next
+  # sweeps would otherwise try again every 15 minutes: an address the relay
+  # rejects was hit 96 times a day, and a failed record turned into a
+  # reminder per sweep. 20 hours, not 24, so a daily reminder at a fixed hour
+  # is not pushed back a day by a sweep that ran a few minutes late.
+  CAP_KEY = 'icodos_reminders:cap:%<submitter_id>d'
+  CAP_TTL = 20 * 3600
 
   module_function
 
@@ -54,7 +66,17 @@ module IcodosReminderSweep
 
       due = due.first(limit)
 
-      due.each { |item| dry_run ? log_intent(item) : deliver!(item) }
+      # Each item on its own. One address the mail relay rejected used to
+      # raise out of this loop, every 15 minutes, and nobody after it in the
+      # list was reminded again, while the heartbeat in the ensure below kept
+      # the status green.
+      due.each do |item|
+        dry_run ? log_intent(item) : deliver!(item)
+      rescue StandardError => e
+        errors << "submission #{item[:submission].id}: #{e.class}: #{e.message}"
+        Rails.logger.error("[icodos-reminders] reminder failed submission=#{item[:submission].id} " \
+                           "to=#{item[:submitter].email}: #{e.class}: #{e.message}")
+      end
     ensure
       release_lock
       heartbeat!(now)
@@ -86,13 +108,13 @@ module IcodosReminderSweep
     deadline = policy.dig('before_deadline', 'deadline')
 
     candidates(submission).filter_map do |submitter|
-      state = state_for(submission, submitter)
+      sent_count, last_sent_at = effective_history(submission, submitter)
 
       at = IcodosReminders.next_at(
         policy: policy,
         sent_at: submitter.sent_at,
-        sent_count: state['sent_count'].to_i,
-        last_sent_at: IcodosReminders.parse_time(state['last_sent_at']),
+        sent_count: sent_count,
+        last_sent_at: last_sent_at,
         deadline: deadline,
         now: now
       )
@@ -103,11 +125,33 @@ module IcodosReminderSweep
         submission: submission,
         submitter: submitter,
         due_at: at,
-        sent_count: state['sent_count'].to_i,
-        escalate: escalate?(policy, state['sent_count'].to_i),
+        sent_count: sent_count,
+        escalate: escalate?(policy, sent_count),
         policy: policy
       }
     end
+  end
+
+  # Reminders this engine sent, plus invitations sent again by hand
+  # ("Resend" in DocuSeal, or the API): upstream records each as a
+  # send_email event, the first invitation included. A resend is a reminder
+  # in all but name, and until November 2026 the schedule did not see it, so
+  # a signer could get the scheduled reminder minutes after the manual one.
+  # Returns [count, time of the last one].
+  def effective_history(submission, submitter)
+    state = state_for(submission, submitter)
+    count = state['sent_count'].to_i
+    last = IcodosReminders.parse_time(state['last_sent_at'])
+
+    return [count, last] if submitter.sent_at.nil?
+
+    resends = SubmissionEvent.where(submitter_id: submitter.id, event_type: 'send_email')
+                             .where('event_timestamp > ?', submitter.sent_at + 120)
+                             .pluck(:event_timestamp)
+
+    return [count, last] if resends.empty?
+
+    [count + resends.size, [last, resends.max].compact.max]
   end
 
   # ORDER AWARENESS. With submitters_order 'preserved' only the person whose
@@ -115,8 +159,14 @@ module IcodosReminderSweep
   # countersigned is worse than not reminding at all. This mirrors what
   # Submissions.send_signature_requests does when first inviting people, and it
   # is what Adobe means by "only the current recipients will be notified".
+  #
+  # Viewers are never reminded. Upstream makes a role that owns no field a
+  # viewer, sends it a "view" invitation and never expects it to sign; a
+  # reminder to sign was wrong for it, and in signing order a viewer that
+  # came first was reminded instead of the signer whose turn it was.
   def candidates(submission)
-    live = submission.submitters.reject { |s| s.completed_at? || s.declined_at? }
+    viewers = submission.template_submitters.to_a.select { |ts| ts['is_viewer'] }.map { |ts| ts['uuid'] }
+    live = submission.submitters.reject { |s| s.completed_at? || s.declined_at? || viewers.include?(s.uuid) }
                      .select { |s| s.sent_at.present? }
 
     return [] if live.empty?
@@ -129,10 +179,12 @@ module IcodosReminderSweep
     Array(ordered.first)
   end
 
+  # The submission's own policy, else the account default that was in force
+  # when the submission was created (IcodosReminders.default_policy_at).
   def policy_for(submission)
     raw = submission.preferences.to_h[IcodosReminders::POLICY_KEY]
 
-    raw = account_default(submission) if raw.nil?
+    raw = IcodosReminders.default_policy_at(account_default(submission), submission.created_at) if raw.nil?
 
     IcodosReminders.normalize(raw)
   end
@@ -206,6 +258,13 @@ module IcodosReminderSweep
     submitter = item[:submitter]
     policy = item[:policy]
 
+    unless claim_daily_slot!(submitter)
+      Rails.logger.info("[icodos-reminders] held submission=#{item[:submission].id} to=#{submitter.email}: " \
+                        'a reminder (or a failed attempt) to this signer is less than 20 hours old')
+
+      return :held
+    end
+
     IcodosReminderMailer.reminder_email(
       submitter,
       note: policy['note'],
@@ -261,7 +320,8 @@ module IcodosReminderSweep
   # Sends one reminder for one submitter, ignoring the dry-run flag and whether
   # the schedule says it is due. This is how the first live reminder was sent,
   # deliberately and one at a time, rather than by flipping the global flag and
-  # letting the sweep loose on everything pending.
+  # letting the sweep loose on everything pending. The 20-hour cap in Redis
+  # still applies.
   def send_one!(submission_id, email)
     submission = Submission.find(submission_id)
     submitter = submission.submitters.find { |s| s.email.to_s.casecmp(email.to_s).zero? }
@@ -275,6 +335,14 @@ module IcodosReminderSweep
     deliver!(submission: submission, submitter: submitter, policy: policy,
              sent_count: state['sent_count'].to_i, due_at: Time.current,
              escalate: escalate?(policy, state['sent_count'].to_i))
+  end
+
+  # True when no reminder went to this signer in the last CAP_TTL, and records
+  # this one. Raises when Redis cannot say, so nothing is sent unrecorded.
+  def claim_daily_slot!(submitter)
+    key = format(CAP_KEY, submitter_id: submitter.id)
+
+    Sidekiq.redis { |c| c.call('SET', key, Time.current.utc.iso8601, 'NX', 'EX', CAP_TTL) } == 'OK'
   end
 
   # ------------------------------------------------------------- lock and beat
@@ -294,7 +362,7 @@ module IcodosReminderSweep
     nil
   end
 
-  # The heartbeat is what makes a dead cron loud. Without it, a stopped
+  # The heartbeat is what makes a dead timer loud. Without it, a stopped
   # scheduler looks exactly like a scheduler with nothing to do — which is how
   # the Pro setting managed to look configured for weeks while sending nothing.
   def heartbeat!(now = Time.current)
@@ -305,7 +373,7 @@ module IcodosReminderSweep
 
   # Cheap by design. An earlier version ran a full dry-run sweep here to show a
   # "due right now" count, which meant every view of the settings page swept all
-  # submissions AND took the sweep lock — so a page load could make the real cron
+  # submissions AND took the sweep lock — so a page load could make the real
   # sweep skip itself as "already running", and every page view wrote a
   # "sweep dry_run" line to the log. The counts were removed from the UI, so the
   # sweep went with them. This now touches Redis once and nothing else.

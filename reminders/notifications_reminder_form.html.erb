@@ -15,8 +15,11 @@
     the MCP tool, which is also the only place a per-document deadline can be
     supplied — a deadline cannot be an account-wide default.
 
-    NO JAVASCRIPT IS ADDED. <submit-form data-on="change"> is DocuSeal's own
-    element, used by the toggle at the top of this page.
+    SAVED WITH A BUTTON, NOT ON CLICK. Until November 2026 the radios sat in
+    DocuSeal's <submit-form data-on="change">, so one click changed the default
+    at once, for every pending signer. The button uses upstream's base-button
+    class, as the BCC form on the same page does. A change applies to
+    documents sent from then on (IcodosReminders.default_record).
 
     ONLY USE CLASSES DOCUSEAL ALREADY USES — see the note in _reminder_banner.
     CHECK ON EVERY DOCUSEAL VERSION BUMP.
@@ -24,7 +27,8 @@
 <%
   default = AccountConfig.find_by(account: current_account, key: IcodosReminders::ACCOUNT_DEFAULT_KEY)&.value
   default = nil unless default.is_a?(Hash)
-  selected = default ? (default['preset'] || 'custom') : 'off'
+  current = default && default.except(*IcodosReminders::DEFAULT_META_KEYS)
+  selected = current.present? ? (current['preset'] || 'custom') : 'off'
 
   choices = [
     ['off',          'Never remind anyone'],
@@ -35,7 +39,6 @@
 %>
 
 <%= form_tag icodos_reminders_path, method: :post, autocomplete: 'off' do %>
-  <submit-form data-on="change">
     <div class="space-y-2">
       <% choices.each do |value, label| %>
         <label class="label cursor-pointer justify-start gap-3">
@@ -55,5 +58,7 @@
         </label>
       <% end %>
     </div>
-  </submit-form>
+    <div class="form-control pt-2">
+      <%= button_tag 'Save', type: 'submit', class: 'base-button' %>
+    </div>
 <% end %>

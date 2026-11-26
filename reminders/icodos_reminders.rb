@@ -96,12 +96,17 @@ module IcodosReminders
       'escalate_after' => 2
     },
 
+    # No escalation: escalating ends the reminders (see stopped?), and this
+    # choice is offered on the settings page as "until they sign".
     'until_signed' => {
       'after_send' => { 'schedule' => [72], 'then_every_hours' => 168 },
-      'stop' => { 'never' => true },
-      'escalate_after' => 3
+      'stop' => { 'never' => true }
     }
   }.freeze
+
+  # Keys of the stored account default that are not part of the policy.
+  DEFAULT_META_KEYS = %w[activated_at earlier].freeze
+  MAX_EARLIER_DEFAULTS = 20
 
   module_function
 
@@ -224,6 +229,70 @@ module IcodosReminders
     raise InvalidPolicy, "stop must be after_count, on, or never (got #{stop.inspect})"
   end
 
+  # --------------------------------------------------------- account default
+  #
+  # The account default is stored with the time it took effect and the
+  # defaults before it, so that a change applies to documents sent from then
+  # on and documents already out keep the schedule they were sent under.
+  # Until November 2026 the stored value was the bare policy, read afresh by
+  # every sweep: one click on the settings page changed the schedule of every
+  # pending signer at once, although the page said "for new documents".
+  #
+  #   { <policy keys, 'preset' among them>,
+  #     'activated_at' => ISO 8601,
+  #     'earlier' => [{ 'policy' => {...} or nil, 'until' => ISO 8601 }, ...] }
+  #
+  # 'earlier' runs oldest first; each entry was in force until its 'until'.
+  # A stored value without activated_at (written before this) has been in
+  # force from the beginning. The preset 'off' is stored like any other, so
+  # that switching reminders off is anchored too.
+
+  # The default policy that applies to a document created at `at`, or nil.
+  def default_policy_at(value, at)
+    return nil unless value.is_a?(Hash)
+
+    value = stringify(value)
+    activated = parse_time(value['activated_at'])
+
+    unless activated.nil? || at.nil? || at >= activated
+      entry = Array(value['earlier']).find do |e|
+        until_time = parse_time(e.is_a?(Hash) ? e['until'] : nil)
+        until_time && at < until_time
+      end
+
+      return policy_or_nil(entry['policy']) if entry
+    end
+
+    policy_or_nil(value.except(*DEFAULT_META_KEYS))
+  end
+
+  # The value to store when `policy` (nil for off) becomes the default now.
+  def default_record(previous, policy, now: Time.current)
+    earlier = []
+    before = nil
+
+    if previous.is_a?(Hash)
+      previous = stringify(previous)
+      earlier = Array(previous['earlier']).select { |e| e.is_a?(Hash) }
+      before = policy_or_nil(previous.except(*DEFAULT_META_KEYS))
+    end
+
+    # No stored value means no reminders were in force, and that is anchored
+    # too: switching reminders on does not start chasing documents sent while
+    # they were off.
+    earlier << { 'policy' => before, 'until' => now.utc.iso8601 }
+
+    (policy || { 'preset' => 'off' }).merge('activated_at' => now.utc.iso8601,
+                                            'earlier' => earlier.last(MAX_EARLIER_DEFAULTS))
+  end
+
+  def policy_or_nil(policy)
+    return nil unless policy.is_a?(Hash) && policy.any?
+    return nil if policy['preset'].to_s == 'off'
+
+    policy
+  end
+
   # ---------------------------------------------------------------- scheduling
 
   # When the next reminder for one submitter is due, or nil if never.
@@ -335,6 +404,15 @@ module IcodosReminders
 
   def stopped?(policy, sent_count:, now: Time.current)
     return true if sent_count >= MAX_TOTAL_PER_SUBMITTER
+
+    # Escalation ends the reminders. The reminder that reaches escalate_after
+    # unanswered goes out together with the note to the sender, which says
+    # that no further reminders follow; until November 2026 they did, up to
+    # the stop count, so the sender was told one thing and the signer got
+    # another.
+    threshold = policy['escalate_after']
+
+    return true if threshold && sent_count > threshold
 
     stop = policy['stop'] || {}
 
@@ -481,21 +559,29 @@ module IcodosReminders
 
     sentence = "#{parts.join(', ')}."
 
-    if (threshold = normalized['escalate_after'])
+    threshold = normalized['escalate_after']
+    after_count = normalized.dig('stop', 'after_count')
+
+    if threshold && (after_count.nil? || threshold < after_count)
       remaining = threshold - sent_count
 
       sentence += remaining.positive? ?
-        " Escalates to #{sender_name.presence || 'the sender'} after #{remaining} more unanswered." :
-        " Already escalated to #{sender_name.presence || 'the sender'}."
+        " Escalates to #{sender_name.presence || 'the sender'} after #{remaining} more unanswered, and stops there." :
+        " Escalates to #{sender_name.presence || 'the sender'} with the next one, and stops there."
+    elsif after_count
+      sentence += " Stops after #{after_count} in total."
     end
 
-    sentence += " Stops after #{normalized.dig('stop', 'after_count')} in total." if normalized.dig('stop', 'after_count')
     sentence += ' Never more than once a day.'
 
     sentence
   end
 
   def stopped_because(policy, sent_count)
+    if policy['escalate_after'] && sent_count > policy['escalate_after']
+      return "escalated to the sender after #{policy['escalate_after']} unanswered, and reminders stop there"
+    end
+
     return "#{sent_count} already sent, which is the limit" if policy.dig('stop', 'after_count').to_i <= sent_count && policy.dig('stop', 'after_count')
     return 'the stop date has passed' if policy.dig('stop', 'on')
     return "the #{MAX_TOTAL_PER_SUBMITTER}-reminder ceiling has been reached" if sent_count >= MAX_TOTAL_PER_SUBMITTER

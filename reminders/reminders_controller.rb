@@ -22,21 +22,24 @@ module Icodos
     before_action :load_config
     authorize_resource :account_config
 
+    # Stored with the time it takes effect and the defaults before it
+    # (IcodosReminders.default_record), so the change applies to documents
+    # sent from now on, as the notice says. Until November 2026 the bare
+    # policy was stored and every pending signer moved to the new schedule at
+    # once; "off" deleted the record, which did the same in the other
+    # direction.
     def create
       policy = build_policy
+      previous = @account_config.persisted? ? @account_config.value : nil
 
-      if policy.nil?
-        @account_config.delete if @account_config.persisted?
-
-        return redirect_back(fallback_location: settings_notifications_path,
-                             notice: 'Reminders are off for new documents.')
-      end
-
-      @account_config.value = policy
+      @account_config.value = IcodosReminders.default_record(previous, policy)
       @account_config.save!
 
-      redirect_back fallback_location: settings_notifications_path,
-                    notice: I18n.t('changes_have_been_saved')
+      notice = policy.nil? ? 'Reminders are off for documents sent from now on.' :
+                             'Saved. This applies to documents sent from now on.'
+      notice += ' Documents already sent keep the schedule they were sent with.'
+
+      redirect_back fallback_location: settings_notifications_path, notice: notice
     rescue Unchanged
       redirect_back fallback_location: settings_notifications_path
     rescue IcodosReminders::InvalidPolicy => e

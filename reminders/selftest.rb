@@ -34,6 +34,8 @@ module IcodosRemindersSelftest
     dst
     caps
     stop_conditions
+    escalation
+    account_default
     deadline_anchor
     paused
     summary
@@ -238,6 +240,60 @@ module IcodosRemindersSelftest
     check('never keeps going', IcodosReminders.upcoming(policy: never, sent_at: sent, now: sent, limit: 6).length == 6)
   end
 
+  # The note to the sender says no further reminders follow. Until November
+  # 2026 they did, up to the stop count.
+  def escalation
+    puts "\nescalation ends the reminders\n\n"
+
+    policy = IcodosReminders.preset('standard')
+    sent = t('2026-08-03 10:00')
+    times = IcodosReminders.upcoming(policy: policy, sent_at: sent, now: sent, limit: 9)
+
+    check('standard: three, then the one that escalates, then none', times.length == 4,
+          times.map { |x| x.strftime('%d %b') }.join(' | '))
+    check('nothing after the escalating reminder',
+          IcodosReminders.next_at(policy: policy, sent_at: sent, sent_count: 4, now: t('2026-08-20 10:00')).nil?)
+    check('the escalating reminder itself still goes',
+          !IcodosReminders.next_at(policy: policy, sent_at: sent, sent_count: 3, now: t('2026-08-20 10:00')).nil?)
+
+    text = IcodosReminders.describe(policy: policy, sent_at: sent, now: sent, sender_name: 'David')
+    check('the sentence says it stops there', text.include?('stops there') && !text.include?('Stops after 6'), text)
+
+    check('until signed does not escalate', IcodosReminders.preset('until_signed')['escalate_after'].nil?)
+  end
+
+  # A new account default applies to documents created from then on.
+  def account_default
+    puts "\naccount default, anchored at its activation\n\n"
+
+    standard = IcodosReminders.preset('standard')
+    gentle = IcodosReminders.preset('gentle')
+    legacy = standard.dup
+    t1 = t('2026-11-26 12:00')
+    t2 = t('2026-11-28 12:00')
+
+    check('a value stored before anchoring applies to everything',
+          IcodosReminders.default_policy_at(legacy, t('2026-01-01 00:00')) == standard)
+
+    v1 = IcodosReminders.default_record(legacy, gentle, now: t1)
+    check('change: documents from before keep the old default',
+          IcodosReminders.default_policy_at(v1, t1 - 1) == standard)
+    check('change: documents from then on get the new one',
+          IcodosReminders.default_policy_at(v1, t1 + 1) == gentle)
+    check('the stored value still normalises',
+          IcodosReminders.normalize(IcodosReminders.default_policy_at(v1, t1 + 1)) == IcodosReminders.normalize(gentle))
+
+    v2 = IcodosReminders.default_record(v1, nil, now: t2)
+    check('off: documents from then on get none', IcodosReminders.default_policy_at(v2, t2 + 1).nil?)
+    check('off: the one in between keeps its default', IcodosReminders.default_policy_at(v2, t1 + 3600) == gentle)
+    check('off: the oldest keeps its default', IcodosReminders.default_policy_at(v2, t1 - 3600) == standard)
+    check('off is stored, not deleted', v2['preset'] == 'off' && v2['activated_at'].present?)
+
+    v3 = IcodosReminders.default_record(nil, standard, now: t2)
+    check('switching on does not chase documents sent while off',
+          IcodosReminders.default_policy_at(v3, t2 - 1).nil? && IcodosReminders.default_policy_at(v3, t2 + 1) == standard)
+  end
+
   def deadline_anchor
     puts "\ndeadline anchor — the Dropbox Sign pattern, for grant reporting\n\n"
 
@@ -284,6 +340,7 @@ module IcodosRemindersSelftest
     check('names the signer', text.include?('Devraj Solanki'))
     check('gives a real date, not a rule', text.match?(/\d{1,2} \w{3}/), text[0, 60])
     check('mentions escalation', text.downcase.include?('escalat'))
+    check('does not promise more after escalating', !text.include?('Stops after 6'))
     check('states the daily cap', text.downcase.include?('once a day'))
 
     off = IcodosReminders.describe(policy: nil, sent_at: sent, now: sent)

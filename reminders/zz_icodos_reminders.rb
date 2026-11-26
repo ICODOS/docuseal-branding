@@ -33,10 +33,10 @@ Rails.application.config.after_initialize do
       last = IcodosReminderSweep.last_swept_at
 
       if last.nil?
-        Rails.logger.info('[icodos-reminders] no sweep has run yet — check the host cron entry is installed')
+        Rails.logger.info('[icodos-reminders] no sweep has run yet — check docuseal-reminders.timer on the host')
       elsif last < 2.hours.ago
         Rails.logger.error("[icodos-reminders] the last sweep was #{last.iso8601}, over two hours ago. " \
-                           'The host cron may be gone; reminders are NOT going out.')
+                           'docuseal-reminders.timer on the host may have stopped; reminders are NOT going out.')
       end
     else
       Rails.logger.info('[icodos-reminders] disabled (ICODOS_REMINDERS_ENABLED is not true)')

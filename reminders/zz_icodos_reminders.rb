@@ -30,14 +30,11 @@ Rails.application.config.after_initialize do
         "#{IcodosReminders::MAX_TOTAL_PER_SUBMITTER} per signer, #{IcodosReminders::MAX_PER_SWEEP} per sweep"
       )
 
-      last = IcodosReminderSweep.last_swept_at
-
-      if last.nil?
-        Rails.logger.info('[icodos-reminders] no sweep has run yet — check docuseal-reminders.timer on the host')
-      elsif last < 2.hours.ago
-        Rails.logger.error("[icodos-reminders] the last sweep was #{last.iso8601}, over two hours ago. " \
-                           'docuseal-reminders.timer on the host may have stopped; reminders are NOT going out.')
-      end
+      # The heartbeat is not read here. This runs before the embedded Redis
+      # has started, so it always found none and reported "no sweep has run
+      # yet" on every boot. A stopped or failing sweep is reported by the
+      # host's health job (no successful sweep for 30 minutes) and by the
+      # settings page and smoke check (heartbeat older than two hours).
     else
       Rails.logger.info('[icodos-reminders] disabled (ICODOS_REMINDERS_ENABLED is not true)')
     end

@@ -118,10 +118,12 @@ module Mcp
     # only field available to carry a marker.
     #
     # Make filters on template.external_id and skips these; it keeps handling
-    # everything else. Templates with the marker are filed by the hook however
-    # they are sent (from the web interface as well, since November 2026), so
-    # between them the two paths cover every submission exactly once. A copy
-    # made in the web interface loses the marker and goes to Make.
+    # everything else. The hook files a submission of a template with the
+    # marker however it was sent (from the web interface as well, since
+    # November 2026), but never a copy: a copy made in the web interface has
+    # no external_id and goes to Make, and a copy that still carries the marker
+    # is left to a person (Filing.destination logs it, the host's health job
+    # reports it).
     PHASE_E_MARKER = 'icodos-phase-e'
 
     ALLOWED_FIELD_TYPES = %w[signature initials date text number checkbox].freeze

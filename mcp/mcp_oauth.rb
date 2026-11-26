@@ -9,7 +9,7 @@
 #   * an OAuth 2.1 authorization server (Strategy B), and
 #   * the OAuth 2.1 resource server guarding /mcp,
 # with Microsoft Entra ID doing the actual user authentication via the
-# existing SSO overlay (sso/entra_auth_controller.rb), which is not modified.
+# existing SSO overlay (sso/entra_auth_controller.rb), which Phase D did not change.
 #
 # Why we are the authorization server rather than pointing clients at Entra:
 #   * MCP clients MUST send RFC 8707 `resource=https://sign.icodos.com/mcp`.
@@ -26,11 +26,13 @@
 #     registrations are signed/MAC'd artifacts, not database rows. No migration,
 #     nothing written to the DocuSeal database, so the blast radius on an
 #     instance holding executed contracts is nil.
-#   * Three token types, separated by BOTH a `token_use` claim AND a distinct
-#     `aud`, so no artifact can be replayed at an endpoint it was not minted for:
-#       code    -> aud = token endpoint, token_use = "code",    60s
-#       refresh -> aud = token endpoint, token_use = "refresh", 14d absolute
-#       access  -> aud = resource URL,   token_use = "access",  1h
+#   * Four token types, kept apart by `token_use` and by `aud` where it
+#     differs, so no artifact can be replayed at an endpoint it was not minted
+#     for:
+#       code          -> aud = token endpoint,         token_use = "code",    60s
+#       refresh       -> aud = token endpoint,         token_use = "refresh", 14d absolute
+#       access        -> aud = resource URL,           token_use = "access",  1h
+#       authz_request -> aud = authorization endpoint, the consent token
 #   * Signing key is an RSA private key mounted read-only from outside this
 #     repo. It is never committed and never logged.
 #
@@ -172,8 +174,9 @@ module McpOauth
   end
 
   # Single-use enforcement for authorization codes, refresh tokens and consent
-  # tokens all rest on `Rails.cache.write(..., unless_exist: true)` returning
-  # false the second time. A NullStore returns true unconditionally, which would
+  # tokens rests on Redis (see consume_jti!), and on `Rails.cache.write(...,
+  # unless_exist: true)` returning false the second time while Redis cannot be
+  # asked. A NullStore returns true unconditionally, which would
   # silently turn every replay check into a no-op. Refuse to enable rather than
   # run with the guard quietly disabled.
   def replay_guard_functional?
@@ -358,7 +361,8 @@ module McpOauth
   #   * a cache-based debounce, so at most one reload per KEY_RELOAD_DEBOUNCE
   #     seconds regardless of request volume;
   #   * an mtime check, so a flood of unknown kids against an unchanged key file
-  #     does no work at all and logs nothing.
+  #     reads no file and parses no key; each request still builds the public
+  #     JWKS and is logged once as a rejected token.
   # A genuine rotation is still picked up within the debounce window, and a
   # container restart picks it up immediately.
   def reload_keys!
@@ -722,8 +726,10 @@ module McpOauth
   # already was. Until then it was Rails.cache, a per-process MemoryStore here:
   # lost at every restart, so after a deploy every refresh token rotated
   # before it became valid again and could start an independent chain until
-  # its 14-day limit. Redis survives an app restart (it is reset only when the
-  # container is recreated) and is shared by every Puma process.
+  # its 14-day limit. Redis writes its snapshot to the data volume
+  # (/data/docuseal/dump.rdb), so the record survives a restart and a deploy;
+  # what was written in the minutes before an unclean stop can be lost. It is
+  # shared by every Puma process.
   #
   # When Redis cannot be asked, the per-process cache stands in and an error
   # is logged: the guarantee falls back to what it was before, never to none.

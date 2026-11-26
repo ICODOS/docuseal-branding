@@ -57,8 +57,9 @@ module Icodos
     end
 
     # The settings page offers four named choices and nothing else, so this only
-    # ever resolves a preset. Anything more specific is set per document through
-    # the MCP tool, where a per-document deadline can actually be supplied.
+    # ever resolves a preset. Nothing more specific is offered anywhere: the
+    # sweep reads a per-document schedule or deadline from a submission's
+    # preferences, but no tool or page writes one; only the Rails console can.
     def build_policy
       preset = params.dig(:icodos_reminders, :preset).to_s
 

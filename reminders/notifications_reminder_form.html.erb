@@ -11,9 +11,10 @@
     date invited people to expect the wrong thing. The h2 above already says what
     this section is.
 
-    Anything more specific than these four options is set per document through
-    the MCP tool, which is also the only place a per-document deadline can be
-    supplied — a deadline cannot be an account-wide default.
+    Anything more specific than these four options, a per-document deadline
+    included, is not offered anywhere; the sweep honours a schedule stored on a
+    submission, but no tool or page writes one. A deadline cannot be an
+    account-wide default.
 
     SAVED WITH A BUTTON, NOT ON CLICK. Until November 2026 the radios sat in
     DocuSeal's <submit-form data-on="change">, so one click changed the default
@@ -48,13 +49,13 @@
         </label>
       <% end %>
 
-      <%# Shown only when a schedule was set through the MCP tool that none of the
-          four options represents, so the page never displays a selection that is
-          not the one in force. %>
+      <%# Shown only when the stored default is none of the four options (written
+          from the Rails console), so the page never displays a selection that
+          is not the one in force. %>
       <% if selected == 'custom' %>
         <label class="label cursor-pointer justify-start gap-3">
           <input type="radio" name="icodos_reminders[preset]" value="custom" class="radio" checked>
-          <span>A custom schedule set through Claude</span>
+          <span>A custom schedule set outside this page</span>
         </label>
       <% end %>
     </div>

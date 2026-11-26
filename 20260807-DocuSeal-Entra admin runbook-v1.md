@@ -1,7 +1,7 @@
 # DocuSeal + Entra SSO — admin runbook
 
 **Instance:** https://sign.icodos.com
-**Server:** `root@31.70.107.24` (IONOS VPS, stack in `/opt/docuseal`)
+**Server:** `root@<host>` (stack in `/opt/docuseal`; the address is in the private operations repository)
 **Overlay repo (this repo):** https://github.com/ICODOS/docuseal-branding
 
 This runbook covers the recurring operational tasks — adding/removing staff, rotating the Entra client secret, and running the MCP OAuth connector (section 7) — plus the break-glass procedure and periodic checks. Written for an admin sitting in the Azure Portal with SSH access to the VPS.
@@ -37,7 +37,7 @@ If you also need the original *setup* guide (one-time Azure app registration, `.
 After the person signs in, in DocuSeal go to **Settings → Users**. The new user should be listed with correct name and email. Server-side you can also confirm:
 
 ```bash
-ssh root@31.70.107.24
+ssh root@<host>
 docker compose -f /opt/docuseal/docker-compose.yml logs --tail 200 app | grep -i "auto-provisioned"
 ```
 
@@ -64,7 +64,7 @@ After this, they can no longer sign in via `/auth/entra` — Microsoft's callbac
 
 ### Step 2 — Archive their DocuSeal record
 
-Any existing browser session they have will keep working until their session cookie expires (default: `SESSION_REMEMBER_DAYS=730` = 2 years). To end their access immediately:
+Any existing browser session they have keeps working until its remember cookie expires: 30 days after their last Microsoft sign-in (`SESSION_REMEMBER_DAYS=30` in `docker-compose.yml`). To end their access immediately:
 
 1. Sign in to DocuSeal as an admin.
 2. **Settings → Users** → find the person.
@@ -78,7 +78,7 @@ If the person authored important templates or submissions, transfer ownership to
 
 ### Verify
 
-1. Try signing in as them from a private browser window on `sign.icodos.com/auth/entra` — should fail with "Your Microsoft account isn't linked to a DocuSeal user" (Entra unassigned) or "Your account has been archived" (DocuSeal archived).
+1. Try signing in as them from a private browser window on `sign.icodos.com/auth/entra` — should fail: Microsoft refuses an account that is no longer assigned (AADSTS50105; if Microsoft hands the error back, DocuSeal shows "Microsoft sign-in was cancelled or refused."), and DocuSeal refuses an archived user with "Your account has been archived. Contact your administrator to restore access."
 2. In DocuSeal, they should no longer appear in **Settings → Users** (or appear under archived users if the UI shows those).
 
 ---
@@ -108,7 +108,7 @@ The whole procedure takes ~5 minutes and causes zero downtime if you follow the 
 Prefer this in-one-Terminal-line approach so the secret never sits on your clipboard longer than necessary. Replace `NEW_SECRET_HERE` with the value you just copied from Azure:
 
 ```bash
-ssh root@31.70.107.24 'set -e; cd /opt/docuseal; cp .env .env.bak-secret-$(date +%s); sed -i "s|^ENTRA_CLIENT_SECRET=.*|ENTRA_CLIENT_SECRET=NEW_SECRET_HERE|" .env; docker compose up -d; sleep 8; docker compose ps'
+ssh root@<host> 'set -e; cd /opt/docuseal; cp .env .env.bak-secret-$(date +%s); sed -i "s|^ENTRA_CLIENT_SECRET=.*|ENTRA_CLIENT_SECRET=NEW_SECRET_HERE|" .env; docker compose up -d; sleep 8; docker compose ps'
 ```
 
 What that does:
@@ -124,7 +124,7 @@ In a private browser window: **https://sign.icodos.com/auth/entra** → sign in 
 Also grep the server logs for any token-exchange errors:
 
 ```bash
-ssh root@31.70.107.24 'docker compose -f /opt/docuseal/docker-compose.yml logs --tail 200 app | grep -i "sso\|entra\|token endpoint"'
+ssh root@<host> 'docker compose -f /opt/docuseal/docker-compose.yml logs --tail 200 app | grep -i "sso\|entra\|token endpoint"'
 ```
 
 If you see `[sso] token verification failed` or `token endpoint returned 401` — the new secret didn't paste correctly. Re-run 3b with the correct value, or fall back to break-glass (section 4) while you diagnose.
@@ -149,10 +149,10 @@ After each rotation, set a reminder in your calendar for **22 months later** so 
 
 ```bash
 # Enable break-glass — password login works again in ~10s
-ssh root@31.70.107.24 'cd /opt/docuseal; sed -i "s/^SSO_BREAK_GLASS=false$/SSO_BREAK_GLASS=true/" .env; docker compose up -d'
+ssh root@<host> 'cd /opt/docuseal; sed -i "s/^SSO_BREAK_GLASS=false$/SSO_BREAK_GLASS=true/" .env; docker compose up -d'
 
 # Once SSO is fixed, disable break-glass and re-enforce
-ssh root@31.70.107.24 'cd /opt/docuseal; sed -i "s/^SSO_BREAK_GLASS=true$/SSO_BREAK_GLASS=false/" .env; docker compose up -d'
+ssh root@<host> 'cd /opt/docuseal; sed -i "s/^SSO_BREAK_GLASS=true$/SSO_BREAK_GLASS=false/" .env; docker compose up -d'
 ```
 
 While break-glass is active, `/sign_in` and `/password/new` behave normally. Staff who never set a password can use "Forgot your password?" on `/sign_in` to receive a reset email and pick their own.
@@ -166,7 +166,7 @@ While break-glass is active, `/sign_in` and `/password/new` behave normally. Sta
 - Azure Portal → **Enterprise applications** → **ICODOS DocuSeal** → **Properties**.
 - Confirm **"Assignment required?"** = **Yes**.
 
-If this ever flips to **No**, any user in the ICODOS Entra tenant will auto-provision a DocuSeal admin account on first sign-in. Entra assignment is the only ACL between the tenant and DocuSeal.
+If this ever flips to **No**, every member account of the tenant with an address on `SSO_ALLOWED_DOMAINS` can sign in, and at its first sign-in gets the unbound DocuSeal user with its address or a new admin. Guests and other domains stay refused by the code. Assignment is what limits sign-in to the people on the list in 5b.
 
 **5b. Assigned user list is current**
 
@@ -190,10 +190,11 @@ If this ever flips to **No**, any user in the ICODOS Entra tenant will auto-prov
 **"AADSTS7000215: Invalid client secret provided" in the browser after signing in on Microsoft**
 The `ENTRA_CLIENT_SECRET` in `.env` doesn't match what Azure has. Almost always: the secret expired, or a paste error during rotation. Fix: rotate again (section 3), being careful with the copy.
 
-**User sees "Your Microsoft account isn't linked to a DocuSeal user. Contact your administrator."**
-Should not happen anymore since auto-provisioning is on. If it does, either:
-- The user's Entra `preferred_username` / `email` claim is empty (unusual — check their Entra profile has an email set).
-- Auto-provisioning failed silently. Check server logs: `docker compose logs --tail 200 app | grep sso`.
+**"Unable to create your DocuSeal account."**
+Provisioning failed; the log line `[sso] auto-provision failed` or `aborted` says why: `docker compose logs --tail 200 app | grep sso`.
+
+**"Microsoft sign-in did not return an email address."**
+Their Entra account has neither `preferred_username` nor `email`; set an email on their Entra profile.
 
 **User sees "This Microsoft account cannot sign in here."**
 The log says why: `docker compose logs --tail 200 app | grep "\[sso\] refused"`. A guest account, a token from another tenant, or a first sign-in with an address outside `SSO_ALLOWED_DOMAINS`. For a new company domain, add it to `SSO_ALLOWED_DOMAINS` in `.env` and `docker compose up -d`.
@@ -217,7 +218,7 @@ Their DocuSeal user exists but is archived. In DocuSeal **Settings → Users** �
 Break-glass (section 4), then diagnose. Common causes:
 - Client secret expired → section 3.
 - Entra Conditional Access policy blocking the app → check Azure Portal → **Microsoft Entra ID → Security → Conditional Access**.
-- Container not running → `ssh root@31.70.107.24 'docker compose -f /opt/docuseal/docker-compose.yml ps'`.
+- Container not running → `ssh root@<host> 'docker compose -f /opt/docuseal/docker-compose.yml ps'`.
 
 **"AADSTS50011: The reply URL specified in the request does not match the reply URLs configured for the application"**
 The redirect URI in Azure (**App registrations → Authentication → Redirect URIs**) is wrong. It must be exactly `https://sign.icodos.com/auth/entra/callback` — no trailing slash, no different subdomain.
@@ -238,7 +239,7 @@ Design notes and the full endpoint list are in the overlay repo's `README.md`, "
 The code ships disabled. To enable:
 
 ```bash
-ssh root@31.70.107.24
+ssh root@<host>
 cd /opt/docuseal
 
 # 1. The signing key must exist first — Docker creates a *directory* in place of a
@@ -319,7 +320,7 @@ Rotating invalidates every issued token **and** every registered OAuth client, b
 Do this if you suspect the key was exposed, or on a schedule if you want one (there's no expiry forcing it).
 
 ```bash
-ssh root@31.70.107.24
+ssh root@<host>
 cd /opt/docuseal
 
 # 1. Keep the old key so tokens already issued keep verifying during the overlap
@@ -352,7 +353,7 @@ If you don't care about the overlap — simplest and fine for a hard rotation �
 **Fast rollback — one line, no file changes.** OAuth off, static Bearer tokens keep working exactly as before Phase D:
 
 ```bash
-ssh root@31.70.107.24
+ssh root@<host>
 cd /opt/docuseal
 # set MCP_OAUTH_ENABLED=false in .env (or delete the line)
 docker compose up -d app
@@ -388,7 +389,7 @@ Same cause and same fix as the SSO version of this message — see section 6. It
 The client registration no longer verifies, normally because the signing key was rotated. Remove and re-add the connector in Claude so it registers again.
 
 **Users are asked to reconnect more often than every 14 days.**
-Access tokens last an hour and are refreshed automatically. If reconnection is being demanded more often, check the container isn't restarting frequently — the refresh-token reuse guard lives in process memory, and a restart can invalidate an in-flight rotated token, which surfaces as one reconnect prompt.
+Access tokens last an hour and are refreshed automatically; used refresh tokens are recorded in Redis, so a restart does not affect them. If reconnection is demanded more often than every 14 days, look in the log for `[mcp-oauth] refresh token reuse refused` and `[mcp-oauth] Redis not reachable`.
 
 **A connector fails to register with HTTP 429.**
 Registration is rate limited to 20 attempts per hour per source IP. Normal use registers once per connection, so this usually means something is retrying in a loop. Wait an hour, or check the logs for what is hammering it.
@@ -419,7 +420,7 @@ SSO-provisioned users have no password — provisioning sets a random one and `S
 ### Turning it off
 
 ```bash
-ssh root@31.70.107.24 'cd /opt/docuseal && sed -i "s/^ICODOS_SSO_REVEAL_ENABLED=.*/ICODOS_SSO_REVEAL_ENABLED=false/" .env && docker compose up -d'
+ssh root@<host> 'cd /opt/docuseal && sed -i "s/^ICODOS_SSO_REVEAL_ENABLED=.*/ICODOS_SSO_REVEAL_ENABLED=false/" .env && docker compose up -d'
 ```
 
 Takes about fifteen seconds. DocuSeal's stock password dialog returns unchanged; nothing else is affected.
@@ -429,7 +430,7 @@ Takes about fifteen seconds. DocuSeal's stock password dialog returns unchanged;
 Run after any enable, restart or DocuSeal version bump:
 
 ```bash
-ssh root@31.70.107.24 'cd /opt/docuseal && docker compose exec -T -w /app app rails runner "require \"icodos_reveal_check\"; IcodosRevealCheck.call"'
+ssh root@<host> 'cd /opt/docuseal && docker compose exec -T -w /app app rails runner "require \"icodos_reveal_check\"; IcodosRevealCheck.call"'
 ```
 
 All seven lines must read `ok`. The one that matters most is **controller patch attached** — if it detaches on a version bump, users are shown a password box they cannot fill, which looks like a user problem rather than a deployment one.
@@ -451,7 +452,7 @@ All seven lines must read `ok`. The one that matters most is **controller patch 
 Nobody can reveal an API key while Microsoft is unreachable, including during an incident. The fallback is the console:
 
 ```bash
-ssh root@31.70.107.24 'cd /opt/docuseal && docker compose exec -T -w /app app rails runner "puts User.find_by(email: %q{someone@icodos.com}).access_token.token"'
+ssh root@<host> 'cd /opt/docuseal && docker compose exec -T -w /app app rails runner "puts User.find_by(email: %q{someone@icodos.com}).access_token.token"'
 ```
 
 Treat the output as a password — it grants full API access to that account and does not expire until rotated. Rotate afterwards if it was handled carelessly.
@@ -463,7 +464,7 @@ The overlay's `.rb` files are bind-mounted and **Rails caches classes in product
 Worse, files under `lib/` must be named for the constant they define: `lib/icodos_reveal.rb` → `IcodosReveal`. A mismatch does not degrade — Zeitwerk raises, the container crash-loops, and with `SSO_ENFORCE=true` nobody can sign in. This took the instance down for 45 seconds on 15 August 2026. After any change under `lib/`, watch the first boot:
 
 ```bash
-ssh root@31.70.107.24 'cd /opt/docuseal && docker compose logs app --since 60s | grep -iE "error|zeitwerk|FATAL"'
+ssh root@<host> 'cd /opt/docuseal && docker compose logs app --since 60s | grep -iE "error|zeitwerk|FATAL"'
 ```
 
 ---
@@ -489,10 +490,10 @@ If the timer stops, the host's health job alerts within half an hour, the settin
 
 ```bash
 # stop sending immediately, keep the schedule and history
-ssh root@31.70.107.24 'cd /opt/docuseal && sed -i "s/^ICODOS_REMINDERS_DRY_RUN=.*/ICODOS_REMINDERS_DRY_RUN=true/" .env && docker compose up -d'
+ssh root@<host> 'cd /opt/docuseal && sed -i "s/^ICODOS_REMINDERS_DRY_RUN=.*/ICODOS_REMINDERS_DRY_RUN=true/" .env && docker compose up -d'
 
 # off entirely
-ssh root@31.70.107.24 'cd /opt/docuseal && sed -i "s/^ICODOS_REMINDERS_ENABLED=.*/ICODOS_REMINDERS_ENABLED=false/" .env && docker compose up -d'
+ssh root@<host> 'cd /opt/docuseal && sed -i "s/^ICODOS_REMINDERS_ENABLED=.*/ICODOS_REMINDERS_ENABLED=false/" .env && docker compose up -d'
 ```
 
 Dry run defaults to **true**. Sending requires setting it to `false` explicitly.
@@ -500,7 +501,7 @@ Dry run defaults to **true**. Sending requires setting it to `false` explicitly.
 ### Checks
 
 ```bash
-ssh root@31.70.107.24 'cd /opt/docuseal && docker compose exec -T -w /app app rails runner "require \"icodos_reminder_check\"; IcodosReminderCheck.call"'
+ssh root@<host> 'cd /opt/docuseal && docker compose exec -T -w /app app rails runner "require \"icodos_reminder_check\"; IcodosReminderCheck.call"'
 tail -20 /var/log/icodos-reminders.log
 ```
 
@@ -521,7 +522,7 @@ tail -20 /var/log/icodos-reminders.log
 
 ### Where the settings are
 
-`/settings/notifications` → *Sign Request Email Reminders*. Four choices and a Save button, nothing else. A saved choice applies to documents sent from then on; documents already sent keep the schedule they were sent with. Per-document schedules, stop-dates and deadline anchoring are set through the MCP tool, not the page — a date cannot be an account-wide default.
+`/settings/notifications` → *Sign Request Email Reminders*. Four choices and a Save button, nothing else. A saved choice applies to documents sent from then on; documents already sent keep the schedule they were sent with. Per-document schedules, stop dates and deadline anchoring exist in the scheduler, but no tool or page sets them; only the Rails console can, and a date cannot be an account-wide default.
 
 The page shows red text only when reminders are **not** reaching anyone: test mode, a stalled scheduler, or the engine switched off. Silence there means it is working.
 

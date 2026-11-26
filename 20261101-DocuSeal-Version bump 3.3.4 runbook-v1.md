@@ -1,6 +1,6 @@
 # DocuSeal 3.1.6 to 3.3.4: deploy runbook
 
-sign.icodos.com, IONOS VPS, `/opt/docuseal`. Overlay repo `ICODOS/docuseal-branding`, branch `main`.
+sign.icodos.com, `/opt/docuseal`. Overlay repo `ICODOS/docuseal-branding`, branch `main`.
 
 Written 1 November 2026 against upstream tag 3.3.4. Everything below was checked against the upstream source at both tags, not against release notes.
 

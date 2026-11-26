@@ -188,7 +188,7 @@ module Mcp
     # recorded in Redis with SET NX before anything is sent, and on the
     # submission, which survives a Redis that lost its last minutes.
     #
-    # Plain Ruby, no Rails: contracts/token_selftest.rb runs it offline.
+    # Plain Ruby, no Rails: contracts/send_selftest.rb runs it offline.
     module PreviewToken
       VERSION = 'pv1'
       TTL = 15 * 60
@@ -875,7 +875,11 @@ module Mcp
 
       return DEFAULT_FIRST_SIGNER_DOMAINS if raw.empty?
 
-      raw.split(',').map { |d| d.strip.downcase.delete_prefix('@') }.reject(&:empty?)
+      list = raw.split(',').map { |d| d.strip.downcase.delete_prefix('@') }.reject(&:empty?)
+
+      # A value with no domain in it (",", " , ") must not switch the guard
+      # off; it falls back to the default like an unset variable.
+      list.empty? ? DEFAULT_FIRST_SIGNER_DOMAINS : list
     end
 
     # A contract that cannot be filed once signed is worse than one that is not

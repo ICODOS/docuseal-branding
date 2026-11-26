@@ -31,7 +31,9 @@
 # which derived the destination by parsing the employee name out of the
 # template name and looking it up in Notion. The folder is recorded at
 # creation by the agent that already knew it. Make skips every template with
-# the ICODOS marker, so whatever carries the marker must be filed here.
+# the ICODOS marker, so a submission of such a template is filed here unless
+# the template is a copy of another; a copy is left to a person (see
+# Filing.destination).
 
 module Icodos
   class FilingHookController < ActionController::API

@@ -298,13 +298,12 @@ module Sso
       url_for(action: :callback, only_path: false)
     end
 
-    # Auto-provision a DocuSeal user for an Entra-authenticated caller that
-    # doesn't yet have one. The Entra Enterprise Application "Assignment
-    # required = Yes" gate is the effective ACL — reaching this point means
-    # the tenant admin has explicitly permitted this user to sign in.
-    #
-    # Password is random (user never sees it); they can set their own via
-    # the standard "Forgot password?" flow if password login is ever needed.
+    # Creates a DocuSeal user for a Microsoft account at its first sign-in.
+    # Reached only from bind_first_sign_in, after the tenant, member and
+    # SSO_ALLOWED_DOMAINS checks, when no user has this address; which members
+    # of the tenant get this far is decided by the Entra setting "Assignment
+    # required". The password is random and never shown. While SSO is
+    # enforced no password is compared, so it is never used.
     def provision_from_claims!(email, claims)
       account = Account.active.first
       if account.nil?
@@ -460,6 +459,10 @@ module Sso
           verify_expiration: true,
           verify_not_before: true,
           verify_iat: true,
+          # The jwt gem skips the expiry check when `exp` is absent, so a
+          # token without one would never expire (see McpOauth::REQUIRED_CLAIMS).
+          # Entra puts both in every id_token; `nbf` is checked whenever present.
+          required_claims: %w[exp iat],
           leeway: JWT_LEEWAY,
           jwks: jwks_loader
         )

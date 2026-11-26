@@ -5,9 +5,12 @@
   password form is the break-glass fallback and is styled as secondary inside
   the same card so the hierarchy stays clear.
 
-  This page only renders when password login is allowed: with SSO_ENFORCE on
-  and no break-glass, the SSO filter redirects GET /sign_in to /auth/entra
-  before it is reached. So the password form never needs to hide itself.
+  With SSO_ENFORCE on and no break-glass, the SSO filter redirects GET
+  /sign_in to /auth/entra before this page is reached, with one exception:
+  a refused Microsoft sign-in comes back with its reason in flash[:alert],
+  and then this page renders with @icodos_sso_only set. The layout shows the
+  reason as its usual toast; the password form is left out, because password
+  login is refused anyway.
 
   No autofocus. Upstream focuses the email field; here the expected action is
   the Microsoft button, and stealing focus to a fallback field below it is
@@ -40,6 +43,10 @@
         Use your ICODOS Microsoft account
       </p>
 
+      <% if @icodos_sso_only %>
+        <%# The reason, also in the page itself: the toast disappears after a few seconds. %>
+        <p class="text-sm text-center mt-2" style="color: #b91c1c;"><%= flash[:alert] %></p>
+      <% else %>
       <%# DaisyUI's own divider: one element for the rule and its label, instead %>
       <%# of a border and a separately positioned caption. %>
       <div class="divider uppercase text-xs text-gray-500 mt-5 mb-2">
@@ -62,6 +69,7 @@
       <% end %>
 
       <%= render 'omniauthable' %>
+      <% end %>
     </div>
   </div>
 

@@ -275,7 +275,17 @@ Rails.application.config.to_prepare do
 
         message = 'Password login is disabled. Please sign in with Microsoft.'
 
-        if request.get?
+        # A refused Microsoft sign-in (archived account, another tenant, a
+        # domain not allowed, a reissued address) lands here with its reason
+        # in flash[:alert]. Redirecting to /auth/entra as usual sent the user
+        # straight back to Microsoft, whose session answered at once, so the
+        # reason was never shown and the browser could loop (finding A8).
+        # Instead the sign-in page renders with the reason and the Microsoft
+        # button only: @icodos_sso_only hides the password form, and POST
+        # /sign_in stays refused below.
+        if request.get? && controller_name == 'sessions' && action_name == 'new' && flash[:alert].present?
+          @icodos_sso_only = true
+        elsif request.get?
           redirect_to '/auth/entra'
         elsif request.format.json?
           render json: { error: message }, status: :forbidden

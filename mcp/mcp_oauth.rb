@@ -718,14 +718,58 @@ module McpOauth
   # Single-use enforcement for authorization codes and rotated refresh tokens.
   # Returns true the first time a jti is seen, false on replay.
   #
-  # Backed by Rails.cache, which on this deployment is a per-process MemoryStore
-  # (`write(..., unless_exist: true)` is atomic within the process, and Puma runs
-  # single-process here). It is therefore best-effort: it is lost on container
-  # restart, and it would not be shared if WEB_CONCURRENCY were ever set above 1
-  # — the initializer warns at boot if that happens. Replay is additionally
-  # bounded by the 60s code lifetime, PKCE, and redirect_uri binding.
+  # Backed by Redis since November 2026 (finding A7), as the API key reveal
+  # already was. Until then it was Rails.cache, a per-process MemoryStore here:
+  # lost at every restart, so after a deploy every refresh token rotated
+  # before it became valid again and could start an independent chain until
+  # its 14-day limit. Redis survives an app restart (it is reset only when the
+  # container is recreated) and is shared by every Puma process.
+  #
+  # When Redis cannot be asked, the per-process cache stands in and an error
+  # is logged: the guarantee falls back to what it was before, never to none.
+  # Replay is additionally bounded by the 60s code lifetime, PKCE, and
+  # redirect_uri binding.
   def consume_jti!(jti, ttl:)
     consume_decision!(jti, true, ttl: ttl) == :first
+  end
+
+  # SET NX with expiry: true for the first writer of a key.
+  def single_use_write(key, value, ttl)
+    ::Sidekiq.redis { |c| c.call('SET', key, value.to_s, 'NX', 'EX', ttl.to_i) } == 'OK'
+  rescue StandardError => e
+    store_fallback!(e)
+    Rails.cache.write(key, value.to_s, unless_exist: true, expires_in: ttl.to_i)
+  end
+
+  def single_use_read(key)
+    ::Sidekiq.redis { |c| c.call('GET', key) }
+  rescue StandardError => e
+    store_fallback!(e)
+    Rails.cache.read(key)
+  end
+
+  # Fixed-window counter for the rate limits of the registration and token
+  # endpoints, shared by every process. nil when no store can count.
+  def count_in_window(key, ttl)
+    ::Sidekiq.redis do |c|
+      count = c.call('INCR', key)
+      c.call('EXPIRE', key, ttl.to_i) if count == 1
+      count
+    end
+  rescue StandardError => e
+    store_fallback!(e)
+    Rails.cache.increment(key, 1, expires_in: ttl.to_i)
+  end
+
+  # Logged at most once a minute per process, so a Redis outage is visible
+  # without flooding the log.
+  def store_fallback!(error)
+    now = Time.now.to_i
+    return if @store_fallback_logged_at && now - @store_fallback_logged_at < 60
+
+    @store_fallback_logged_at = now
+    Rails.logger.error("[mcp-oauth] Redis not reachable for the single-use records (#{error.class}: " \
+                       "#{error.message}); using the per-process cache until it is")
   end
 
   # Same single-use guarantee as consume_jti!, but it records WHAT the answer was.
@@ -741,9 +785,9 @@ module McpOauth
     return :replay if jti.to_s.empty?
 
     key = "mcp_oauth:jti:#{Digest::SHA256.hexdigest(jti.to_s)}"
-    return :first if Rails.cache.write(key, decision, unless_exist: true, expires_in: [ttl.to_i, 60].max)
+    return :first if single_use_write(key, decision, [ttl.to_i, 60].max)
 
-    stored = Rails.cache.read(key)
+    stored = single_use_read(key)
     stored.nil? ? :replay : stored
   end
 

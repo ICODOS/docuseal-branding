@@ -322,10 +322,12 @@ module Sso
       nil
     end
 
-    # Fixed-window counter. Uses Rails.cache.increment, which is atomic and
-    # auto-creates the key on this store — a read-then-write version would let
-    # concurrent Puma threads all read the same value and advance the counter by
-    # one, making the effective ceiling limit x thread-count.
+    # Fixed-window counter, in Redis since November 2026 (finding A7): an
+    # atomic INCR shared by every process, which a restart no longer resets.
+    # A read-then-write version would let concurrent Puma threads all read the
+    # same value and advance the counter by one, making the effective ceiling
+    # limit x thread-count. Falls back to Rails.cache.increment while Redis
+    # cannot be asked (McpOauth.count_in_window).
     #
     # Keyed on request.remote_ip. Behind this deployment's Caddy that is the real
     # client address and is NOT spoofable: Caddy appends the peer address to
@@ -336,7 +338,7 @@ module Sso
     def rate_limited?(bucket, limit:, period:)
       window = Time.now.to_i / period.to_i
       key    = "mcp_oauth:rl:#{bucket}:#{window}"
-      count  = Rails.cache.increment(key, 1, expires_in: period.to_i * 2)
+      count  = McpOauth.count_in_window(key, period.to_i * 2)
 
       # A store that cannot increment would return nil; treat that as not limited
       # rather than locking the endpoint out entirely.

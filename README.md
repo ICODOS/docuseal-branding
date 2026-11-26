@@ -192,7 +192,7 @@ Three token types, separated by both a `token_use` claim and a distinct `aud`, s
 
 **Known limitations, stated plainly.** Both were confirmed by the independent security review and are accepted consequences of the stateless design, not oversights.
 
-*Refresh-token reuse detection is best-effort.* It uses `Rails.cache`, which here is a per-process `MemoryStore`. Tokens still **rotate** on every use (which OAuth 2.1 requires); what is best-effort is *detecting* that a superseded token was replayed. The burn list is lost on container restart and would not be shared if Puma were configured to run a worker cluster — the initializer logs a warning at boot if `WEB_CONCURRENCY` or `WEB_CONCURRENCY_AUTO` would cause that. Practically: an attacker holding a stolen refresh token that has since been rotated gets one more chance after each deploy, until the absolute 14-day cap expires it.
+*Refresh-token reuse detection rests on Redis.* Tokens **rotate** on every use (which OAuth 2.1 requires), and the record of used refresh tokens, authorization codes and consent tokens, as well as the rate-limit counters, is kept in the Redis that DocuSeal already runs, with `SET NX EX` and `INCR`. Until November 2026 it was `Rails.cache`, a per-process `MemoryStore`: lost at every restart, so after each deploy a stolen refresh token that had since been rotated was valid again until its 14-day cap. Redis is shared by every Puma process and writes its snapshot to the data volume, so the record survives a restart and a deploy; what was written in the minutes before an unclean stop can still be lost. While Redis cannot be asked, the per-process cache stands in and `[mcp-oauth] Redis not reachable for the single-use records` is logged once a minute: the guarantee falls back to what it was, never to none. The boot line ends `single_use=redis`.
 
 *There is no per-grant revocation.* The levers are, in order of proportionality:
 
@@ -545,7 +545,7 @@ DocuSeal hardcodes `config.cache_store = :memory_store`, which is **per-process 
 
 Grants and rate limits therefore use Redis, which is already present and configured for Sidekiq. `SET .. NX .. EX` and `GETDEL` are atomic, so mint and consume are genuinely single-use across processes rather than nearly so. Nothing else about how DocuSeal caches is changed.
 
-**This applies to Phase D too.** `mcp_oauth.rb` enforces single-use authorization codes and refresh tokens through `Rails.cache`, and its probe checks that `unless_exist` is *honoured* — which MemoryStore does — but not that the store is *shared*. Same shape, same silent failure mode. Left alone deliberately: it is reviewed code in the authentication path and should move under review, not as a side effect.
+**Phase D followed in November 2026.** `mcp_oauth.rb` enforced single-use authorization codes and refresh tokens through `Rails.cache`, whose probe checks that `unless_exist` is *honoured* but not that the store is *shared*. It moved to Redis as its own reviewed change (finding A7), tested on the scratch stack with a refresh token presented again after an app restart.
 
 Rate limited to 5 attempts per user per minute. A successful reveal is logged; upstream logs nothing.
 

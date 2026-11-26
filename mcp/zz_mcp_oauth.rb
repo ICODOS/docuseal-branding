@@ -102,20 +102,20 @@ Rails.application.config.after_initialize do
         Rails.logger.info(
           "[mcp-oauth] enabled. issuer=#{McpOauth.issuer} resource=#{McpOauth.resource} " \
           "kid=#{McpOauth.current_kid[0, 12]} access_ttl=#{McpOauth.access_token_ttl}s " \
-          "refresh_ttl=#{McpOauth.refresh_token_ttl}s redirect_hosts=#{McpOauth.allowed_redirect_hosts.join(',')}"
+          "refresh_ttl=#{McpOauth.refresh_token_ttl}s redirect_hosts=#{McpOauth.allowed_redirect_hosts.join(',')} " \
+          'single_use=redis'
         )
 
-        # Upstream config/puma.rb runs a cluster when EITHER of these is set, and
-        # each worker then gets its own MemoryStore.
+        # Upstream config/puma.rb runs a cluster when EITHER of these is set.
+        # Since the single-use records moved to Redis (A7) the workers share
+        # them; only the fallback while Redis is unreachable is per process.
         clustered = ENV['WEB_CONCURRENCY'].to_i > 1 || ENV['WEB_CONCURRENCY_AUTO'] == 'true'
 
         if clustered
           Rails.logger.warn(
-            '[mcp-oauth] Puma is configured to run a worker cluster (WEB_CONCURRENCY / ' \
-            'WEB_CONCURRENCY_AUTO). Rails.cache is a per-process MemoryStore here, so the single-use guard ' \
-            'for authorization codes, consent tokens and rotated refresh tokens is no longer shared between ' \
-            'workers. Authorization codes stay bound by PKCE, redirect_uri and a 60s lifetime, but replay ' \
-            'detection is weakened. Use a shared cache store, or keep Puma single-process.'
+            '[mcp-oauth] Puma runs a worker cluster (WEB_CONCURRENCY / WEB_CONCURRENCY_AUTO). The single-use ' \
+            'records are in Redis and shared; while Redis is unreachable each worker falls back to its own ' \
+            'cache, and replay detection is weaker for that time.'
           )
         end
       end

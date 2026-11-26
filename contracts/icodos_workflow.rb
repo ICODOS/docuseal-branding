@@ -659,6 +659,10 @@ module IcodosWorkflow
     DEFAULT_DAYS = 90
     MIN_DAYS = 30
     MAX_PER_RUN = 25
+    # When a submission kept its documents because its filed copy was not
+    # at the recorded path. Checked again a day later, not every hour.
+    KEPT_KEY = 'icodos_retention_kept_at'
+    RECHECK = 24 * 3600
 
     module_function
 
@@ -680,13 +684,21 @@ module IcodosWorkflow
       days ? "#{days}d" : 'off'
     end
 
-    def due(now: Time.current, limit: MAX_PER_RUN)
+    # Every submission due, oldest first. The limit applies to removals, not
+    # to candidates: a first version cut the list at 25 before the SharePoint
+    # check, so 25 submissions whose filed copy had moved would have held
+    # every later one back for good.
+    def due(now: Time.current)
       return [] unless days
 
       Submission.where(archived_at: nil).where('completed_at < ?', now - days * 86_400)
                 .order(:completed_at).to_a
-                .select { |s| s.preferences.to_h[FILED_KEY].present? && s.preferences.to_h[PURGED_KEY].blank? }
-                .first(limit)
+                .select do |s|
+                  prefs = s.preferences.to_h
+                  kept = prefs[KEPT_KEY].present? && Time.zone.parse(prefs[KEPT_KEY].to_s)
+
+                  prefs[FILED_KEY].present? && prefs[PURGED_KEY].blank? && !(kept && kept > now - RECHECK)
+                end
     end
 
     # rubocop:disable Metrics
@@ -694,13 +706,16 @@ module IcodosWorkflow
       purged = []
       kept = []
 
-      due(now: now, limit: limit).each do |submission|
+      due(now: now).each do |submission|
+        break if purged.size >= limit
+
         path = submission.preferences.to_h[FILED_KEY]
 
         unless IcodosGraph.exists?(path)
           kept << submission.id
           Rails.logger.warn("[icodos-contracts] retention: submission #{submission.id} keeps its documents: the " \
                             "filed copy is no longer at #{path.inspect} in SharePoint")
+          submission.update!(preferences: submission.preferences.to_h.merge(KEPT_KEY => now.utc.iso8601)) unless dry_run
           next
         end
 

@@ -324,6 +324,25 @@ The two hidden tools are upstream's. They sat next to the guarded ICODOS tools w
 
 `ICODOS_MCP_HIDDEN_TOOLS` controls this: unset hides these two, a comma-separated list hides exactly that list, `none` offers everything upstream ships. It is independent of `ICODOS_CONTRACTS_ENABLED` on purpose. A lapsed Graph certificate switches the contract tools off, and that must not be what puts the unguarded tools back.
 
+### The audit record
+
+Every `tools/call` to `/mcp`, whichever tool it names and however it ends, leaves one JSON line in `/data/docuseal/icodos_audit/mcp-YYYY-MM.jsonl` on the data volume (mode 0600). The nightly backup takes the volume whole, and a deploy does not touch it; the container log, the only trace before November 2026, starts afresh at every deploy.
+
+```json
+{"at":"2026-11-26T10:47:26.318Z","request_id":"…","user_id":1,"auth":"oauth","client":"29f6a17ea0df",
+ "client_name":"Claude","tool":"icodos_send_contract","args_sha256":"43f4…","outcome":"ok",
+ "sent":true,"submission_id":120,"template_id":129,"ms":874}
+```
+
+- No argument in clear: they carry employees' names and private addresses. `args_sha256` is SHA-256 over the arguments as canonical JSON (keys sorted at every level, as `[key, value]` pairs, no whitespace), so a known call can be matched to its line.
+- `client` is the first 12 hex digits of SHA-256 over the OAuth `client_id`, with the client's registered name beside it; `static:<id>` for a static MCP token. The `[mcp-oauth]` log lines show the first 12 characters of the `client_id` itself, which are the same for every client.
+- `outcome` is `ok`, `tool_error`, `protocol_error`, `unauthorized`, `forbidden` or `http_<status>`. `sent` tells a preview of the send tool from a send.
+- It fails open: a line that cannot be written is logged as `[icodos-audit] could not write …` and the call stands. It is written after the response exists, so it could not stop the action anyway. The boot line `[icodos-contracts] tool policy: … audit=<dir> audit_identity=attached` says where it writes and whether the caller is being noted.
+
+```bash
+docker compose exec -T app tail -n 20 /data/docuseal/icodos_audit/mcp-$(date -u +%Y-%m).jsonl
+```
+
 ### Why not the upstream tools
 
 `create_template` accepts only a name and an optional URL, hardcodes the folder to the account default and the fields to `[]`, and its URL branch needs the contract exposed at a fetchable address. `send_documents` has no signing-order parameter and falls back to `'random'` when the template preference is unset — which is the case for every template created before Phase E. Employer-first is a hard requirement for employment documents, so it is hardcoded here.
@@ -423,6 +442,8 @@ Deliveries are recorded as `WebhookEvent`s and visible in the DocuSeal UI, so fa
 | `ICODOS_CONTRACTS_FIRST_SIGNER_DOMAINS` | Optional; defaults to `icodos.com,icodos.de`. Also the company domains for the email code default |
 | `ICODOS_CONTRACTS_EMAIL_CODE` | Optional; `external` (default), `all` or `off`: who enters an emailed code before the document opens |
 | `ICODOS_CONTRACTS_FIXED_TERM_GUARD` | Optional; `on` (default) refuses fixed-term employment documents, `off` lifts it |
+| `ICODOS_AUDIT_DIR` | Optional; where the audit record of tool calls is written, default `/data/docuseal/icodos_audit` |
+| `ICODOS_FILING_HOOK_URL` | Optional; the filing hook's registered address, default `http://app:3000/icodos/hooks/filing` |
 | `ICODOS_MCP_HIDDEN_TOOLS` | Optional; unset hides `send_documents` and `create_template`. `none` hides nothing |
 
 ### The credential

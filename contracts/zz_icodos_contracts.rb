@@ -111,12 +111,28 @@ module IcodosContracts
   # upstream tool, an ICODOS tool and everything else. Everything else falls
   # straight through to upstream — including malformed bodies, so upstream
   # keeps ownership of its -32700 parse error.
+  #
+  # Every tools/call, whichever of the three it reaches and however it ends,
+  # leaves one line in the audit record (IcodosAudit), written in an ensure
+  # after the response exists.
   module Dispatch
     def call
       body = icodos_mcp_body
 
       return super unless body.is_a?(Hash) && body['method'] == 'tools/call'
 
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+      begin
+        icodos_dispatch(body) { super() }
+      ensure
+        IcodosAudit.record_call(request, response, body, started)
+      end
+    end
+
+    private
+
+    def icodos_dispatch(body)
       name = body.dig('params', 'name')
 
       # First, and outside every rescue: nothing that goes wrong further down
@@ -129,7 +145,7 @@ module IcodosContracts
 
       controller = IcodosContracts.controller_for(name)
 
-      return super if controller.nil?
+      return yield if controller.nil?
 
       # Upstream sets this before dispatching and McpBaseController#mcp_params
       # reads from it. Without it every tool argument would arrive nil.
@@ -137,8 +153,6 @@ module IcodosContracts
 
       controller.dispatch(:call, request, response)
     end
-
-    private
 
     def icodos_mcp_body
       JSON.parse(request.raw_post)
@@ -174,6 +188,154 @@ module IcodosContracts
   end
 end
 
+# The audit record of agent actions (finding O4): one JSON line per
+# tools/call, appended to a file per month on the data volume, which the
+# nightly backup takes whole and which survives deploys (the container log,
+# until November 2026 the only trace, does not).
+#
+#   {"at":"2026-11-26T10:00:00.123Z","request_id":"...","user_id":1,
+#    "auth":"oauth","client":"3f2a9c01b7de","client_name":"Claude",
+#    "tool":"icodos_send_contract","args_sha256":"...","outcome":"ok",
+#    "sent":true,"submission_id":120,"template_id":129,"ms":812}
+#
+# No arguments in clear: they carry employees' names and private addresses.
+# args_sha256 is SHA-256 over the arguments as canonical JSON (keys sorted
+# at every level, as [key, value] pairs, no whitespace), so a known call can
+# be matched to its line. client is the first 12 hex digits of SHA-256 over
+# the OAuth client_id (the client_id itself starts alike for every client,
+# which is why the [mcp-oauth] log lines cannot tell clients apart), or
+# "static:<mcp_tokens id>" for a static token. outcome is ok, tool_error,
+# protocol_error, unauthorized, forbidden or http_<status>.
+#
+# Fails open: a record that cannot be written is logged as an error and the
+# call stands. It is written after the response exists, so it could not
+# stop the action anyway; the error line is what makes a gap visible.
+module IcodosAudit
+  DEFAULT_DIR = '/data/docuseal/icodos_audit'
+
+  module_function
+
+  def dir
+    ENV['ICODOS_AUDIT_DIR'].to_s.strip.presence || DEFAULT_DIR
+  end
+
+  def path(now = Time.now.utc)
+    File.join(dir, "mcp-#{now.strftime('%Y-%m')}.jsonl")
+  end
+
+  def canonical(value)
+    case value
+    when Hash then value.map { |k, v| [k.to_s, canonical(v)] }.sort_by(&:first)
+    when Array then value.map { |v| canonical(v) }
+    else value
+    end
+  end
+
+  def digest(args)
+    OpenSSL::Digest::SHA256.hexdigest(JSON.generate(canonical(args || {})))
+  end
+
+  # rubocop:disable Metrics
+  def record_call(request, response, body, started)
+    env = request.env
+    args = body.dig('params', 'arguments')
+    args = {} unless args.is_a?(Hash)
+    tool = body.dig('params', 'name').to_s[0, 80]
+    status = response.status.to_i
+    parsed = begin
+      JSON.parse(response.body.to_s)
+    rescue JSON::ParserError
+      nil
+    end
+
+    outcome =
+      if status == 401 then 'unauthorized'
+      elsif status == 403 then 'forbidden'
+      elsif !parsed.is_a?(Hash) || status != 200 then "http_#{status}"
+      elsif parsed['error'] then 'protocol_error'
+      elsif parsed.dig('result', 'isError') then 'tool_error'
+      else 'ok'
+      end
+
+    data = begin
+      outcome == 'ok' ? JSON.parse(parsed.dig('result', 'content', 0, 'text').to_s) : nil
+    rescue JSON::ParserError
+      nil
+    end
+    data = {} unless data.is_a?(Hash)
+
+    template_id = args['template_id'].presence || (tool == 'icodos_create_contract_template' ? data['id'] : nil)
+
+    entry = {
+      'at' => Time.now.utc.iso8601(3),
+      'request_id' => request.request_id,
+      'user_id' => env['icodos.mcp.user_id'],
+      'auth' => env['icodos.mcp.auth'] || 'none',
+      'client' => env['icodos.mcp.client'],
+      'client_name' => env['icodos.mcp.client_name'],
+      'tool' => tool,
+      'args_sha256' => digest(args),
+      'outcome' => outcome,
+      'sent' => [true, false].include?(data['sent']) ? data['sent'] : nil,
+      'submission_id' => data['submission_id'],
+      'template_id' => template_id.is_a?(Integer) || template_id.to_s.match?(/\A\d+\z/) ? template_id.to_i : nil,
+      'ms' => ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round
+    }.compact
+
+    write(entry)
+  rescue StandardError => e
+    Rails.logger.error("[icodos-audit] could not build the audit record (#{e.class}: #{e.message}); tool=#{tool}")
+  end
+  # rubocop:enable Metrics
+
+  def write(entry)
+    FileUtils.mkdir_p(dir, mode: 0o700)
+
+    File.open(path, File::WRONLY | File::APPEND | File::CREAT, 0o600) do |f|
+      f.flock(File::LOCK_EX)
+      f.write("#{JSON.generate(entry)}\n")
+    end
+  rescue StandardError => e
+    Rails.logger.error("[icodos-audit] could not write the audit record to #{path} (#{e.class}: #{e.message}); " \
+                       "tool=#{entry['tool']} user_id=#{entry['user_id']} outcome=#{entry['outcome']}")
+  end
+
+  # Prepended to Mcp::McpBaseController. Notes who called and through which
+  # client in the request, which the dispatcher shares with the tool
+  # controller, so the record can say it after the call. Reads what the
+  # OAuth hook leaves on the controller; changes nothing about who is let in.
+  module Identity
+    private
+
+    def current_user
+      user = super
+
+      icodos_note_caller(user) if user && !request.env.key?('icodos.mcp.user_id')
+
+      user
+    end
+
+    def icodos_note_caller(user)
+      env = request.env
+      env['icodos.mcp.user_id'] = user.id
+      principal = instance_variable_get(:@icodos_oauth_principal)
+
+      if principal
+        env['icodos.mcp.auth'] = 'oauth'
+        env['icodos.mcp.client'] = OpenSSL::Digest::SHA256.hexdigest(principal.client_id.to_s)[0, 12]
+        env['icodos.mcp.client_name'] = McpOauth.parse_client(principal.client_id)&.name
+      else
+        token = request.headers['Authorization'].to_s[/\ABearer\s+(.+)\z/, 1].to_s
+        env['icodos.mcp.auth'] = 'static'
+        env['icodos.mcp.client'] = "static:#{McpToken.find_by(sha256: Digest::SHA256.hexdigest(token))&.id}"
+      end
+    rescue StandardError => e
+      # The call goes on; the record will say less about who made it.
+      Rails.logger.error("[icodos-audit] could not note the caller (#{e.class}: #{e.message})")
+    end
+  end
+end
+
 # Applied unconditionally rather than gated on enabled?, so that flipping
 # ICODOS_CONTRACTS_ENABLED needs nothing but the container restart that
 # `docker compose up -d` already performs. Both modules check at request time.
@@ -194,6 +356,11 @@ Rails.application.config.to_prepare do
     unless Mcp::ProtocolController.instance_variable_get(:@_icodos_contracts_patched)
       Mcp::ProtocolController.instance_variable_set(:@_icodos_contracts_patched, true)
       Mcp::ProtocolController.prepend(IcodosContracts::ToolsList)
+    end
+
+    unless Mcp::McpBaseController.instance_variable_get(:@_icodos_audit_patched)
+      Mcp::McpBaseController.instance_variable_set(:@_icodos_audit_patched, true)
+      Mcp::McpBaseController.prepend(IcodosAudit::Identity)
     end
   rescue NameError => e
     # Partial rollback, or an upstream rename of McpController /
@@ -216,8 +383,17 @@ Rails.application.config.after_initialize do
     hidden = IcodosContracts.hidden_tools
     unknown = hidden - McpController::TOOLS.map { |tool| tool[:name].to_s }
 
+    audit = begin
+      FileUtils.mkdir_p(IcodosAudit.dir, mode: 0o700)
+      File.writable?(IcodosAudit.dir) ? IcodosAudit.dir : "#{IcodosAudit.dir} (NOT WRITABLE)"
+    rescue StandardError => e
+      "#{IcodosAudit.dir} (NOT WRITABLE: #{e.class})"
+    end
+    identity = Mcp::McpBaseController.ancestors.include?(IcodosAudit::Identity)
+
     Rails.logger.info("[icodos-contracts] tool policy: hidden=#{hidden.empty? ? 'none' : hidden.join(',')} " \
-                      "hooks=#{attached ? 'attached' : 'NOT ATTACHED'}")
+                      "hooks=#{attached ? 'attached' : 'NOT ATTACHED'} " \
+                      "audit=#{audit} audit_identity=#{identity ? 'attached' : 'missing'}")
 
     if unknown.any?
       # A typo in the variable, or upstream renamed a tool. Either way the tool

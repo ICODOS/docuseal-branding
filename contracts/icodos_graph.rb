@@ -111,7 +111,24 @@ module IcodosGraph
   # specifically because Graph addresses drive items as
   # /root:/{path}:/content — a colon in `path` would terminate the address
   # early and silently retarget the request at a different item.
-  FORBIDDEN_PATH_CHARS = /[\\:*?"<>|]|[[:cntrl:]]/
+  #
+  # Since November 2026 (finding T8) also:
+  #   %   a SharePoint address may be decoded more than once on the way, so
+  #       "%2e%2e" passed this check as text and could arrive as ".."
+  #   #   ends the address at a fragment on some SharePoint endpoints
+  #   format characters (\p{Cf}): zero-width spaces and joiners, bidi
+  #       overrides, the byte-order mark. Invisible, so a path that reads as
+  #       one folder can name another.
+  # No path in use on 26 November 2026 contained any of them (285 checked).
+  FORBIDDEN_PATH_CHARS = /[\\:*?"<>|%#]|[[:cntrl:]]|\p{Cf}/
+
+  # Characters that look like a separator or a dot but are not one. Checked
+  # on the compatibility form of each segment (NFKC), which maps fullwidth
+  # and similar forms to their plain equivalents: a segment that reads as
+  # ".." or holds a slash in that form is refused, whatever SharePoint would
+  # make of it. The path itself is never rewritten; Mac file names may be
+  # stored decomposed, and a rewritten name would address a different file.
+  SEPARATOR_LOOKALIKES = %r{[/\\]}
 
   KEY_MUTEX = Mutex.new
   TOKEN_MUTEX = Mutex.new
@@ -379,6 +396,16 @@ module IcodosGraph
     raise PathError, 'path contains a relative segment' if segments.any? { |s| s == '..' || s == '.' }
     raise PathError, 'path contains an empty segment' if segments.any?(&:empty?)
 
+    # SharePoint trims spaces around a name and a trailing dot, so "Folder."
+    # and " Folder" can name a different item than the text says.
+    if segments.any? { |s| s != s.strip || s.end_with?('.') }
+      raise PathError, 'path contains a folder or file name with leading or trailing spaces, or a trailing dot'
+    end
+
+    if segments.any? { |s| lookalike_segment?(s) }
+      raise PathError, 'path contains a character that resembles a dot or a slash'
+    end
+
     # Prefix match on SEGMENTS, not on the string. A string comparison would
     # accept ".../01 Employee contracts evil/x.pdf" as being inside
     # ".../01 Employee contracts". Any one of the configured trees may match.
@@ -393,6 +420,24 @@ module IcodosGraph
     end
 
     path
+  end
+
+  def lookalike_segment?(segment)
+    compat = segment.unicode_normalize(:nfkc)
+
+    return false if compat == segment
+
+    %w[. ..].include?(compat.strip) || compat.match?(SEPARATOR_LOOKALIKES) || compat.match?(FORBIDDEN_PATH_CHARS)
+  rescue ArgumentError, Encoding::CompatibilityError
+    true
+  end
+
+  # For comparing names Graph returns with names asked for: the same text in
+  # composed or decomposed form is the same name.
+  def nfc(text)
+    text.to_s.unicode_normalize(:nfc)
+  rescue ArgumentError, Encoding::CompatibilityError
+    text.to_s
   end
 
   # Strip leading/trailing separators and collapse runs of them. Does not
@@ -442,34 +487,53 @@ module IcodosGraph
     "#{GRAPH_ROOT}/drives/#{drive_id}/root"
   end
 
-  # Server-relative path of the document library, decoded — e.g.
-  # "/sites/ICODOSGmbH/Shared Documents". Read from the drive's webUrl rather
-  # than hardcoded, because the library's URL name ("Shared Documents") is not
-  # its display name ("Documents") and differs between tenants and languages.
-  def drive_web_path
-    return @drive_web_path if @drive_web_path
-
-    body = get_json("#{GRAPH_ROOT}/drives/#{drive_id}")
-
-    @drive_web_path = URI::DEFAULT_PARSER.unescape(URI.parse(body.fetch('webUrl')).path)
-  end
-
-  # SharePoint REST address for a file's bytes.
+  # The file at a validated path, as SharePoint itself resolves it, checked
+  # against what was asked for; returns its unique id (finding T8).
   #
-  # Used instead of Graph's /content because Graph does not serve content: it
-  # redirects to _layouts/15/download.aspx, which in this tenant rejects a
-  # bearer token of either audience and answers 401 with an HTML sign-in page.
-  # SharePoint's own REST endpoint accepts the SharePoint-audience token.
-  def odata_content_path(path)
-    server_relative = "#{drive_web_path}/#{path}"
+  # The bytes used to be fetched by path through SharePoint's legacy
+  # GetFileByServerRelativeUrl, which decodes its argument once more than
+  # Graph does. What the allowlist had approved as text and what SharePoint
+  # finally opened could therefore differ. Now Graph resolves the path once,
+  # the item it found must be a file whose real folder and name are the ones
+  # asked for (and inside the permitted folders), and the bytes are then
+  # fetched by that item's id, so no path is interpreted a second time.
+  UUID_RE = /\A\h{8}-\h{4}-\h{4}-\h{4}-\h{12}\z/.freeze
 
-    # OData string literals escape a single quote by doubling it. Names like
-    # "O'Brien" are otherwise a syntax error, and a plausible one here.
-    literal = server_relative.gsub("'", "''")
+  # rubocop:disable Metrics
+  def resolve_file!(path)
+    item = get_json("#{drive_root}:/#{encode_path(path)}?$select=id,name,file,folder,parentReference,sharepointIds",
+                    path)
 
-    encoded = literal.split('/').map { |segment| ERB::Util.url_encode(segment) }.join('/')
+    raise PathError, "#{path} is a folder, not a file" unless item['file'].is_a?(Hash)
 
-    "#{site_path}/_api/web/GetFileByServerRelativeUrl('#{encoded}')/$value"
+    parent = URI::DEFAULT_PARSER.unescape(item.dig('parentReference', 'path').to_s)
+                                .sub(%r{\A/drives?(?:/[^/]+)?/root:/?}, '')
+    resolved = [parent, item['name'].to_s].reject(&:empty?).join('/')
+
+    unless nfc(resolved) == nfc(path)
+      raise PathError, "SharePoint resolved #{path} to #{resolved}, which is not the path asked for"
+    end
+
+    # The folder SharePoint reports must itself pass the allowlist.
+    normalize_path!(resolved)
+
+    unique = item.dig('sharepointIds', 'listItemUniqueId').to_s
+
+    raise GraphError.new("SharePoint returned no usable item id for #{path}") unless unique.match?(UUID_RE)
+
+    unique
+  end
+  # rubocop:enable Metrics
+
+  # SharePoint REST address for a file's bytes, by its unique id.
+  #
+  # SharePoint REST, not Graph's /content, because Graph does not serve
+  # content: it redirects to _layouts/15/download.aspx, which in this tenant
+  # rejects a bearer token of either audience and answers 401 with an HTML
+  # sign-in page. SharePoint's own REST endpoint accepts the
+  # SharePoint-audience token.
+  def content_by_id_path(unique)
+    "#{site_path}/_api/web/GetFileById('#{unique}')/$value"
   end
 
   # -------------------------------------------------------------------- files
@@ -514,11 +578,13 @@ module IcodosGraph
     end
   end
 
-  # Returns the raw bytes of a file. Path is validated before use.
+  # Returns the raw bytes of a file. Path is validated before use, and the
+  # file is fetched by the id SharePoint resolved it to (see resolve_file!).
   def download(raw_path)
     path = normalize_path!(raw_path)
+    unique = resolve_file!(path)
 
-    resp = connection.get("https://#{site_hostname}#{odata_content_path(path)}") do |req|
+    resp = connection.get("https://#{site_hostname}#{content_by_id_path(unique)}") do |req|
       req.headers['Authorization'] = "Bearer #{access_token(sharepoint_resource)}"
       req.headers['Accept'] = 'application/octet-stream'
     end

@@ -22,6 +22,8 @@ ENV['ICODOS_CONTRACTS_PATH_PREFIX'] = "#{P}|#{Q}"
 ENV['ICODOS_GRAPH_SITE_HOSTNAME'] = 'example.sharepoint.com'
 ENV['ICODOS_GRAPH_SITE_PATH'] = '/sites/SelfTest'
 
+require 'erb'
+require 'uri'
 require_relative 'icodos_graph'
 
 FAILS = []
@@ -48,7 +50,21 @@ MUST_REJECT = [
   ['dot segment',             "#{P}/./x.pdf"],
   ['different top folder',    'Shared/09 Legal Documents/10 Contracts/01 Employee contracts/x.pdf'],
   ['sibling of second tree',  'General/03 Public Financing/05 Reporting for public funded projects/x.pdf'],
-  ['second tree, bypass',     "#{Q} evil/x.pdf"]
+  ['second tree, bypass',     "#{Q} evil/x.pdf"],
+  # T8, November 2026
+  ['percent-encoded dots',    "#{P}/%2e%2e/%2e%2e/Payroll/x.pdf"],
+  ['percent sign',            "#{P}/100%.pdf"],
+  ['hash',                    "#{P}/a#b.pdf"],
+  ['zero-width space',        "#{P}/Signed​Contracts/x.pdf"],
+  ['bidi override',           "#{P}/‮fdp.exe/x.pdf"],
+  ['byte-order mark',         "#{P}/﻿x.pdf"],
+  ['fullwidth dots',          "#{P}/．．/Payroll/x.pdf"],
+  ['one-dot leaders',         "#{P}/․․/Payroll/x.pdf"],
+  ['fullwidth slash',         "#{P}/a／b.pdf"],
+  ['fullwidth percent',       "#{P}/a％b.pdf"],
+  ['trailing space segment',  "#{P}/Signed Contracts /x.pdf"],
+  ['leading space segment',   "#{P}/ Signed Contracts/x.pdf"],
+  ['trailing dot segment',    "#{P}/Signed Contracts./x.pdf"]
 ].freeze
 
 MUST_ACCEPT = [
@@ -60,7 +76,10 @@ MUST_ACCEPT = [
   ['duplicated separators',   "#{P}//Signed Contracts///x.pdf"],
   ['second tree itself',      Q],
   ['inside the second tree',  "#{Q}/2026-08 Timesheet Devraj Solanki.pdf"],
-  ['umlaut in second tree',   "#{Q}/2026-08 Zeiterfassung Jörg Müller.pdf"]
+  ['umlaut in second tree',   "#{Q}/2026-08 Zeiterfassung Jörg Müller.pdf"],
+  ['decomposed umlaut',       "#{P}/Signed Contracts/000031 Jörg Müller/x.pdf"],
+  ['dot inside a name',       "#{P}/Signed Contracts/v1.2 draft.pdf"],
+  ['comma and apostrophe',    "#{Q}/O'Brien, Sean.pdf"]
 ].freeze
 
 puts "\npath allowlist — must reject\n\n"
@@ -99,10 +118,11 @@ puts "\nsite/drive resolution\n\n"
 
 module IcodosGraph
   class << self
-    attr_accessor :stub_error
+    attr_accessor :stub_error, :stub_item
 
     def get_json(url, _context = nil)
       raise stub_error if stub_error
+      return stub_item if stub_item && url.include?('?$select=id,name,file')
 
       url.include?('/drive') ? { 'id' => 'DRIVE123' } : { 'id' => 'SITE123' }
     end
@@ -231,6 +251,57 @@ begin
 rescue StandardError => e
   check('svc.ms host: GET, no token', false, "#{e.class}: #{e.message}")
 end
+
+# ------------------------------------------------- resolving a file (T8)
+
+# The bytes are fetched by the id SharePoint resolves a path to, and only
+# when the item it found is a file at exactly the folder and name asked for.
+
+puts "\nfile resolution before download\n\n"
+
+reset_resolution!
+IcodosGraph.drive_id
+UUID = '0f8fad5b-d9cb-469f-a165-70867728950e'
+ASKED = "#{P}/Signed Contracts/000031 Jörg Müller/Änderung.pdf"
+
+def item_for(parent_path, name, file: true, uuid: UUID)
+  { 'id' => 'ITEM1', 'name' => name, 'parentReference' => { 'path' => parent_path },
+    'sharepointIds' => { 'listItemUniqueId' => uuid } }.merge(file ? { 'file' => {} } : { 'folder' => {} })
+end
+
+def encoded(path)
+  path.split('/').map { |s| ERB::Util.url_encode(s) }.join('/')
+end
+
+def resolve_case(label, item, want)
+  IcodosGraph.stub_item = item
+  got = IcodosGraph.resolve_file!(ASKED)
+  check(label, want == :ok && got == UUID, "id #{got}")
+rescue IcodosGraph::Error => e
+  check(label, want == e.class, "#{e.class.name.split('::').last}: #{e.message[0, 70]}")
+ensure
+  IcodosGraph.stub_item = nil
+end
+
+parent = File.dirname(ASKED)
+resolve_case('the file asked for',
+             item_for("/drives/DRIVE123/root:/#{encoded(parent)}", File.basename(ASKED)), :ok)
+resolve_case('decomposed name from Graph',
+             item_for("/drive/root:/#{encoded(parent.unicode_normalize(:nfd))}",
+                      File.basename(ASKED).unicode_normalize(:nfd)), :ok)
+resolve_case('resolved to another folder',
+             item_for("/drives/DRIVE123/root:/#{encoded("#{P}/Signed Contracts/000032 Other")}",
+                      File.basename(ASKED)), IcodosGraph::PathError)
+resolve_case('resolved outside the trees',
+             item_for('/drives/DRIVE123/root:/General/Payroll', File.basename(ASKED)), IcodosGraph::PathError)
+resolve_case('a folder, not a file',
+             item_for("/drives/DRIVE123/root:/#{encoded(parent)}", File.basename(ASKED), file: false),
+             IcodosGraph::PathError)
+resolve_case('no usable item id',
+             item_for("/drives/DRIVE123/root:/#{encoded(parent)}", File.basename(ASKED), uuid: "x')/x"),
+             IcodosGraph::GraphError)
+check('content address uses the id', IcodosGraph.content_by_id_path(UUID) ==
+      "/sites/SelfTest/_api/web/GetFileById('#{UUID}')/$value")
 
 puts
 if FAILS.empty?

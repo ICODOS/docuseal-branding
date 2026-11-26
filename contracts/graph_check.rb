@@ -99,7 +99,12 @@ module IcodosGraphCheck
         '/etc/passwd',
         "#{IcodosGraph.path_prefix}/../Payroll/salaries.xlsx",
         "#{IcodosGraph.path_prefix} evil/x.pdf",
-        "#{IcodosGraph.path_prefix}/a:b.pdf"
+        "#{IcodosGraph.path_prefix}/a:b.pdf",
+        "#{IcodosGraph.path_prefix}/%2e%2e/%2e%2e/x.pdf",
+        "#{IcodosGraph.path_prefix}/a#b.pdf",
+        "#{IcodosGraph.path_prefix}/．．/x.pdf",
+        "#{IcodosGraph.path_prefix}/a​b/x.pdf",
+        "#{IcodosGraph.path_prefix}/Folder./x.pdf"
       ]
 
       leaked = cases.reject do |c|

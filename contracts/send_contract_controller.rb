@@ -255,6 +255,8 @@ module Mcp
       return render_tool_error('Phase E is not enabled on this instance') unless IcodosGraph.enabled?
 
       raise InvalidArguments, 'template has been archived' if @template.archived_at?
+
+      ensure_original_contract_template!
       raise InvalidArguments, 'template has no fields — nothing to sign' if @template.fields.blank?
 
       # Same refusal as upstream send_documents since 3.4.0.
@@ -490,6 +492,30 @@ module Mcp
       raise InvalidArguments,
             'this preview_token has already been used to send. Nothing was sent again. If a second copy ' \
             'really is wanted, make a new preview and show it to the requester.'
+    end
+
+    # Only an original template made by icodos_create_contract_template.
+    # A template made in the web interface, or a copy of a contract template,
+    # carries a filing folder and file name that belong to another document:
+    # sent from here, its signed copy went into the first employee's folder
+    # under the first employee's file name, and, the copy having lost the
+    # marker that keeps Make away, was filed by Make a second time.
+    def ensure_original_contract_template!
+      marker = Icodos::FilingHookController::MARKER
+      original = Icodos::FilingHookController::Filing.copy_of(@template)
+
+      if @template.external_id != marker
+        raise InvalidArguments,
+              "template #{@template.id} was not made by icodos_create_contract_template (it was made in the web " \
+              'interface, or it is a copy of one). Its filing folder and file name may belong to another ' \
+              'document. Create the template with icodos_create_contract_template.'
+      end
+
+      return unless original
+
+      raise InvalidArguments,
+            "template #{@template.id} is a copy of template #{original}, and its filing folder and file name belong " \
+            'to that one. Create a new template with icodos_create_contract_template.'
     end
 
     def ensure_not_fixed_term!

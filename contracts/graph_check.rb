@@ -144,7 +144,8 @@ module IcodosGraphCheck
     end
 
     step('filing webhook registered') do
-      hooks = WebhookUrl.all.select { |w| w.url.to_s.end_with?(Icodos::FilingHookController::HOOK_PATH) }
+      hook_url = Icodos::FilingHookController.hook_url
+      hooks = WebhookUrl.all.select { |w| w.url.to_s == hook_url }
 
       if hooks.empty?
         raise 'no WebhookUrl points at the filing hook — signed PDFs would never be filed by Phase E'
@@ -154,7 +155,7 @@ module IcodosGraphCheck
         raise 'the filing webhook is registered but not subscribed to submission.completed'
       end
 
-      others = WebhookUrl.all.reject { |w| w.url.to_s.end_with?(Icodos::FilingHookController::HOOK_PATH) }
+      others = WebhookUrl.all.reject { |w| w.url.to_s == hook_url }
                          .select { |w| w.events.include?('submission.completed') }
 
       note = others.any? ? " (also: #{others.length} other submission.completed subscriber — parallel run)" : ''
@@ -188,6 +189,23 @@ module IcodosGraphCheck
         raise "read back #{readback.bytesize} bytes, expected #{payload.bytesize}" if readback != payload
 
         'byte-identical'
+      end
+
+      # Filing uploads with conflict: 'fail' so that a signed contract is
+      # never replaced. Whether Graph honours it, also through the SharePoint
+      # redirect, can only be shown against the real tenant.
+      step('write probe: no overwrite') do
+        begin
+          IcodosGraph.upload(path, "overwritten #{payload}", content_type: 'text/plain', conflict: 'fail')
+        rescue IcodosGraph::GraphError => e
+          raise "expected 409, got #{e.status}: #{e.message}" unless e.status == 409
+
+          next 'second upload refused with 409, first file intact' if IcodosGraph.download(path) == payload
+
+          raise 'refused with 409, but the file changed'
+        end
+
+        raise 'a second upload with conflict fail REPLACED the file; filing could overwrite a signed contract'
       end
 
       step('write probe: cleanup') do

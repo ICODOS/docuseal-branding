@@ -118,14 +118,16 @@ module Mcp
     # only field available to carry a marker.
     #
     # Make filters on template.external_id and skips these; it keeps handling
-    # everything sent from the DocuSeal UI or the upstream tools, which carry no
-    # filing folder and which Phase E therefore ignores. Between them the two
-    # paths cover every submission exactly once.
+    # everything else. Templates with the marker are filed by the hook however
+    # they are sent (from the web interface as well, since November 2026), so
+    # between them the two paths cover every submission exactly once. A copy
+    # made in the web interface loses the marker and goes to Make.
     PHASE_E_MARKER = 'icodos-phase-e'
 
     ALLOWED_FIELD_TYPES = %w[signature initials date text number checkbox].freeze
     MAX_FIELDS = 40
     MAX_NAME_LENGTH = 250
+    MAX_SOURCE_BYTES = 3 * 1024 * 1024
 
     # Raised for anything the caller could fix by changing its arguments. Kept
     # distinct from Graph and DocuSeal failures so the message can say which.
@@ -200,6 +202,17 @@ module Mcp
 
       raise InvalidArguments, "#{source_path} is empty" if bytes.empty?
 
+      # The signed copy is the draft plus signatures and the audit trail, and
+      # it is filed with Graph's simple upload, which takes 4 MiB. A larger
+      # draft used to be accepted (up to 32 MiB) and its signed copy could
+      # then never be filed. Production drafts are well under 2 MB.
+      if bytes.bytesize > MAX_SOURCE_BYTES
+        raise InvalidArguments,
+              "#{source_path} is #{(bytes.bytesize / 1_048_576.0).round(1)} MB. Drafts are limited to " \
+              "#{MAX_SOURCE_BYTES / 1_048_576} MB so that the signed copy can be filed in SharePoint; reduce " \
+              'the file (images, embedded fonts) and try again.'
+      end
+
       # Cheap insurance against a .docx passed by mistake, or a file OneDrive
       # has only partly written. Without it the template is created from
       # whatever arrived and the problem surfaces at signature time.
@@ -228,7 +241,11 @@ module Mcp
         # to 'random'.
         'submitters_order' => 'preserved',
         'icodos_filing_folder' => filing_folder,
-        'icodos_source_path' => source_path
+        'icodos_source_path' => source_path,
+        # A copy of this template inherits these preferences, this one
+        # included, and so can be told from the original: its folder and
+        # file name belong to the original's employee.
+        'icodos_template_id' => @template.id
       )
 
       # FilenameUtils.basename(blob[:filename]) is how upstream names documents

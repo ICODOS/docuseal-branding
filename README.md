@@ -381,15 +381,23 @@ ruby contracts/send_selftest.rb
 - **Fixed-term employment documents are refused**, for now: they are signed on paper. The caller must state `fixed_term` for every send, and the template name, source file name, document names and role names are checked for working student, intern, thesis, fixed-term and extension wording (permanent, "unbefristet", is not a match). `ICODOS_CONTRACTS_FIXED_TERM_GUARD=off` lifts it on the server.
 - **Every role must own a signature field.** Upstream turns a role without fields into a viewer and invites the next role at once, so a template whose fields all belonged to the employee passed the first-signer check on the employer's address and then went straight to the employee. The create tool refuses such a field list before reading the file; the send tool refuses a template whose first role does not sign.
 - **The first signer must be at a configured domain** (`ICODOS_CONTRACTS_FIRST_SIGNER_DOMAINS`, default `icodos.com,icodos.de`). The first signer countersigns for ICODOS; without this, an instruction smuggled into a document could send a fabricated contract with both roles pointed at addresses an attacker controls.
-- **Filing never overwrites.** A name collision files alongside with a numeric suffix and logs a warning, because silently replacing an executed employment contract is not an acceptable failure mode.
-- **Filing is idempotent.** The filed path is recorded on the submission; DocuSeal retries any non-2xx up to ten times, and a transient failure after a successful upload must not duplicate a contract.
-- **Submissions without a recorded filing folder are ignored**, so anything sent outside these tools is left to whatever automation already handles it.
+- **Filing never overwrites.** A name collision files alongside with a numeric suffix and logs a warning. The upload asks Graph to fail rather than replace (`@microsoft.graph.conflictBehavior=fail`), so not even a race between the existence check and the write replaces an executed contract; the graph check's write probe proves the 409 against the tenant.
+- **Filing is idempotent.** The chosen name is recorded on the submission before the upload, the filed path after it, and one filing per submission runs at a time (a Redis lock). A retry after a lost response finds its own file under the recorded name, compares it byte for byte and records it, instead of filing a second copy. DocuSeal retries any non-2xx up to ten times; after that, the host's hourly reconciliation (`Filing.reconcile`, `docuseal-filing.timer` in the operations repository) files whatever the hook should have filed and has not.
+- **What the hook files.** A submission with a filing folder (sent by `icodos_send_contract`), and a submission of a template made by `icodos_create_contract_template` sent any other way, into the template's folder: the Make scenario skips those templates by their marker, so until November 2026 such a submission was filed by nobody. Not a copy of such a template: a copy inherits the original's folder and file name, which belong to the original's employee. The create tool records the template's own id so that a copy can be recognised, and the send tool refuses copies and templates it did not make. Everything else is left to the Make scenario.
+- **Drafts are limited to 3 MB.** The signed copy is filed with Graph's simple upload, which takes 4 MiB; a larger draft used to be accepted (up to 32 MiB) and its signed copy could then never be filed.
 
 ### The filing webhook
 
-`POST /icodos/hooks/filing`, registered as a DocuSeal webhook pointing at `http://app:3000/icodos/hooks/filing` — inside the compose network, never publicly exposed. `SendWebhookRequest` only enforces HTTPS and blocks localhost when `Docuseal.multitenant?`, which is false here, so an internal address is accepted.
+`POST /icodos/hooks/filing`, registered as a DocuSeal webhook pointing at `http://app:3000/icodos/hooks/filing` — inside the compose network; the proxy refuses the path from outside. `SendWebhookRequest` only enforces HTTPS and blocks localhost when `Docuseal.multitenant?`, which is false here, so an internal address is accepted.
 
-It is still authenticated: DocuSeal HMAC-signs every webhook and the signature is verified with `WebhookUrls::Signatures.verify`. Note that `WebhookUrl#url` is encrypted non-deterministically, so the registration cannot be found with a SQL `LIKE` — the lookup filters in Ruby after decryption.
+It is still authenticated: DocuSeal HMAC-signs every webhook and the signature is verified with `WebhookUrls::Signatures.verify`, against the registration whose address is exactly the hook's (`ICODOS_FILING_HOOK_URL` if the address ever differs), and the submission must belong to that registration's account. Until November 2026 any registration whose address merely ended in the hook path was accepted, and any admin can register one. Note that `WebhookUrl#url` is encrypted non-deterministically, so the registration cannot be found with a SQL `LIKE` — the lookup filters in Ruby after decryption.
+
+To file one submission by hand, or to see why it was not filed (the log says), from `/opt/docuseal`:
+
+```bash
+docker compose exec -T -w /app app rails runner \
+  'Icodos::FilingHookController::Filing.call(Submission.find(<id>))'
+```
 
 Register it once:
 

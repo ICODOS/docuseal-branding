@@ -534,8 +534,16 @@ module IcodosGraph
     body
   end
 
-  # Writes bytes to a path, creating or replacing. Path is validated before use.
-  def upload(raw_path, content, content_type: 'application/pdf')
+  # Writes bytes to a path. Path is validated before use.
+  #
+  # Graph replaces an existing file by default. conflict: 'fail' asks it to
+  # answer 409 instead, which is what filing a signed contract needs: an
+  # executed contract is never overwritten, not even by a race between the
+  # existence check and the write. The graph check's write probe proves the
+  # 409 against the real tenant.
+  CONFLICT_BEHAVIOURS = %w[fail replace rename].freeze
+
+  def upload(raw_path, content, content_type: 'application/pdf', conflict: nil)
     path = normalize_path!(raw_path)
     bytes = content.to_s
 
@@ -543,7 +551,11 @@ module IcodosGraph
       raise GraphError.new("upload to #{path} is #{bytes.bytesize} bytes, over the #{MAX_UPLOAD_BYTES} simple-upload limit")
     end
 
-    resp = authorized(:put, "#{drive_root}:/#{encode_path(path)}:/content") do |req|
+    raise ArgumentError, "unknown conflict behaviour #{conflict.inspect}" if conflict && !CONFLICT_BEHAVIOURS.include?(conflict)
+
+    query = conflict ? "?@microsoft.graph.conflictBehavior=#{conflict}" : ''
+
+    resp = authorized(:put, "#{drive_root}:/#{encode_path(path)}:/content#{query}") do |req|
       req.headers['Content-Type'] = content_type
       req.body = bytes
     end

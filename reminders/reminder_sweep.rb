@@ -337,6 +337,18 @@ module IcodosReminderSweep
              escalate: escalate?(policy, state['sent_count'].to_i))
   end
 
+  # Whether claim_daily_slot! would succeed now, without claiming anything:
+  # false while a reminder to this signer is less than CAP_TTL old, nil when
+  # Redis cannot say. For a preview (icodos_set_reminders) that must not
+  # promise a reminder the cap would hold.
+  def claimable?(submitter)
+    key = format(CAP_KEY, submitter_id: submitter.id)
+
+    Sidekiq.redis { |c| c.call('EXISTS', key) }.to_i.zero?
+  rescue StandardError
+    nil
+  end
+
   # True when no reminder went to this signer in the last CAP_TTL, and records
   # this one. Raises when Redis cannot say, so nothing is sent unrecorded.
   def claim_daily_slot!(submitter)

@@ -31,7 +31,14 @@ module IcodosContracts
   # survive a Rails reload in development.
   TOOL_CONTROLLER_NAMES = {
     'icodos_create_contract_template' => 'Mcp::IcodosCreateContractTemplateController',
-    'icodos_send_contract' => 'Mcp::IcodosSendContractController'
+    'icodos_send_contract' => 'Mcp::IcodosSendContractController',
+    # Phase 5: read (track) and act (correct) after a send. The three that
+    # act preview first and confirm with a preview_token, as the send does.
+    'icodos_pending_signatures' => 'Mcp::IcodosPendingSignaturesController',
+    'icodos_get_submission' => 'Mcp::IcodosGetSubmissionController',
+    'icodos_set_reminders' => 'Mcp::IcodosSetRemindersController',
+    'icodos_void_submission' => 'Mcp::IcodosVoidSubmissionController',
+    'icodos_correct_signer' => 'Mcp::IcodosCorrectSignerController'
   }.freeze
 
   # THE TOOL POLICY (finding T1): which upstream tools agents may use here.
@@ -457,6 +464,7 @@ module IcodosAudit
     data = {} unless data.is_a?(Hash)
 
     template_id = args['template_id'].presence || (tool == 'icodos_create_contract_template' ? data['id'] : nil)
+    submission_id = data['submission_id'] || args['submission_id']
 
     entry = {
       'at' => Time.now.utc.iso8601(3),
@@ -469,7 +477,9 @@ module IcodosAudit
       'args_sha256' => digest(args),
       'outcome' => outcome,
       'sent' => [true, false].include?(data['sent']) ? data['sent'] : nil,
-      'submission_id' => data['submission_id'],
+      # The three action tools: false for a preview, true once done.
+      'applied' => [true, false].include?(data['applied']) ? data['applied'] : nil,
+      'submission_id' => submission_id.is_a?(Integer) || submission_id.to_s.match?(/\A\d+\z/) ? submission_id.to_i : nil,
       'template_id' => template_id.is_a?(Integer) || template_id.to_s.match?(/\A\d+\z/) ? template_id.to_i : nil,
       'ms' => ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000).round
     }.compact
@@ -616,11 +626,37 @@ Rails.application.config.after_initialize do
                          'and refused upstream tools are reachable')
     end
 
+    # Every tool controller and the library they share, loaded now rather
+    # than at the first call: a file that does not load (a typo, an upstream
+    # constant renamed on a version bump) is then a failed boot, which
+    # deploy.sh rolls back, not a tool that answers "unknown" for weeks.
+    if IcodosContracts.enabled?
+      broken = IcodosContracts::TOOL_CONTROLLER_NAMES.values.filter_map do |name|
+        name.constantize::SCHEMA
+        nil
+      rescue StandardError, ScriptError => e
+        "#{name} (#{e.class}: #{e.message.to_s[0, 160]})"
+      end
+
+      begin
+        IcodosWorkflow::Lifecycle
+      rescue StandardError, ScriptError => e
+        broken << "IcodosWorkflow (#{e.class}: #{e.message.to_s[0, 160]})"
+      end
+
+      if broken.any?
+        Rails.logger.error("[icodos-contracts] tool controllers NOT attached: #{broken.join('; ')}")
+      end
+    end
+
     if IcodosContracts.enabled?
       Rails.logger.info(
         "[icodos-contracts] enabled. site=#{IcodosGraph.site_hostname}#{IcodosGraph.site_path} " \
         "prefixes=#{IcodosGraph.path_prefixes.inspect} " \
         "tools=#{IcodosContracts::TOOL_CONTROLLER_NAMES.keys.join(',')} " \
+        "presets=#{Mcp::IcodosCreateContractTemplateController::PRESET_NAMES.size} " \
+        "lifecycle=#{ENV['ICODOS_TEMPLATE_LIFECYCLE'].to_s.strip.casecmp('off').zero? ? 'off' : 'on'} " \
+        "retention=#{IcodosWorkflow::Retention.describe} " \
         "cert_expires=#{IcodosGraph.certificate.not_after.utc.iso8601} " \
         'send=preview_token ' \
         "fixed_term_guard=#{ENV['ICODOS_CONTRACTS_FIXED_TERM_GUARD'].to_s.strip.casecmp('off').zero? ? 'off' : 'on'} " \

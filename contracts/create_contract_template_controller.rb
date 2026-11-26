@@ -21,6 +21,69 @@
 
 module Mcp
   class IcodosCreateContractTemplateController < McpBaseController
+    # NAMED FIELD PRESETS. The layouts in use, kept here so an agent names
+    # one instead of carrying coordinates around (they used to live as JSON
+    # files in SharePoint and were passed through on every call). Geometry as
+    # DocuSeal stores it: fractions of the page, origin top-left, zero-based
+    # pages, -1 for the last page. submitter_index maps onto roles in order.
+    #
+    # Measured, not designed: amendment_v1 and full_contract_v1 from the
+    # verified templates of 14 and 19 August 2026; the time declarations from
+    # the templates in production in October and November 2026 (43 of 46 EU
+    # declarations and every OXBREN one since October share these positions;
+    # the other 3 EU ones had their block lower, because more work packages
+    # pushed it down). A layout that moves needs fields, not a preset, and
+    # edit_url is where that is seen.
+    date = ->(name, idx, x, y, w, h, page, fmt = 'DD/MM/YYYY') do
+      { 'name' => name, 'submitter_index' => idx, 'type' => 'date', 'required' => true,
+        'preferences' => { 'format' => fmt }, 'areas' => [{ 'page' => page, 'x' => x, 'y' => y, 'w' => w, 'h' => h }] }
+    end
+    field = ->(name, type, idx, x, y, w, h, page) do
+      { 'name' => name, 'submitter_index' => idx, 'type' => type, 'required' => true,
+        'areas' => [{ 'page' => page, 'x' => x, 'y' => y, 'w' => w, 'h' => h }] }
+    end
+    eu = [date.call('Employee Date', 0, 0.1674, 0.3917, 0.2026, 0.0189, 0),
+          field.call('Employee Signature', 'signature', 0, 0.1539, 0.4289, 0.2208, 0.0231, 0)]
+    oxbren = [date.call('Employee Date', 0, 0.0475, 0.8590, 0.2970, 0.0252, 0),
+              field.call('Employee Signature', 'signature', 0, 0.0475, 0.9090, 0.2970, 0.0336, 0)]
+
+    PRESETS = {
+      'amendment_v1' => {
+        roles: 2,
+        fields: [date.call('Employer Date', 0, 0.1166, 0.1120, 0.2, 0.0286, 1),
+                 field.call('Employer Signature', 'signature', 0, 0.1502, 0.1709, 0.2491, 0.0341, 1),
+                 date.call('Employee Date', 1, 0.5265, 0.1057, 0.2, 0.0286, 1),
+                 field.call('Employee Signature', 'signature', 1, 0.5353, 0.1742, 0.2491, 0.0341, 1)]
+      },
+      'full_contract_v1' => {
+        roles: 2,
+        fields: [date.call('Employer Date', 0, 0.2169, 0.1605, 0.1446, 0.0286, -1),
+                 field.call('Employer Signature', 'signature', 0, 0.1566, 0.2379, 0.2656, 0.0341, -1),
+                 date.call('Employee Date', 1, 0.6386, 0.1605, 0.1447, 0.0286, -1),
+                 field.call('Employee Signature', 'signature', 1, 0.5863, 0.2379, 0.2493, 0.0341, -1),
+                 date.call('Employee Receipt Date', 1, 0.4278, 0.4530, 0.1446, 0.0286, -1),
+                 field.call('Employee Receipt Signature', 'signature', 1, 0.3756, 0.5305, 0.2493, 0.0341, -1)]
+      },
+      'eu_time_declaration_v5' => {
+        roles: 2,
+        fields: eu + [date.call('Supervisor Date', 1, 0.5806, 0.3934, 0.1922, 0.0172, 0),
+                      field.call('Supervisor Name', 'text', 1, 0.5829, 0.4249, 0.2063, 0.0147, 0),
+                      field.call('Supervisor Signature', 'signature', 1, 0.5651, 0.4462, 0.2253, 0.0215, 0)]
+      },
+      'eu_time_declaration_v5_single' => { roles: 1, fields: eu },
+      'oxbren_time_declaration_v1' => {
+        roles: 2,
+        fields: oxbren + [date.call('Supervisor Date', 1, 0.5939, 0.8590, 0.2970, 0.0252, 0),
+                          field.call('Supervisor Signature', 'signature', 1, 0.5939, 0.9090, 0.2970, 0.0336, 0)]
+      },
+      'oxbren_time_declaration_v1_single' => { roles: 1, fields: oxbren }
+    }.each_value { |v| v[:fields].each(&:freeze) }.freeze
+    PRESET_NAMES = PRESETS.keys.freeze
+
+    # An employee folder name, which routes a completed document to the Make
+    # scenario's Notion write-back. A reusable template must never have one.
+    EMPLOYEE_FOLDER_RE = /\A\d{6} /.freeze
+
     SCHEMA = {
       name: 'icodos_create_contract_template',
       title: 'Create ICODOS Contract Template',
@@ -56,11 +119,28 @@ module Mcp
             description: 'Signing roles IN SIGNING ORDER. The employer signs first, so ["Employer", "Employee"].',
             items: { type: 'string' }
           },
+          preset: {
+            type: 'string',
+            enum: PRESET_NAMES,
+            description: 'A named field layout kept on the server, instead of fields: amendment_v1 (2-page ' \
+                         'amendment, 2 roles), full_contract_v1 (full contract, 3 blocks on the last page, 2 ' \
+                         'roles), eu_time_declaration_v5 / _single (EU monthly declaration; Employee and ' \
+                         'Supervisor, or Employee alone), oxbren_time_declaration_v1 / _single. roles are mapped ' \
+                         'in order. Check the result in edit_url: a layout that moved needs fields instead.'
+          },
+          reusable: {
+            type: 'boolean',
+            description: 'Optional. true makes a standard template that is sent again and again with values ' \
+                         'filled in (a monthly time sheet): it is never archived after filing, and every send ' \
+                         'names its signed copy (filing_name). Needs a folder_name that is not an employee ' \
+                         'folder ("000NNN Name"). Leave it out for a contract.'
+          },
           fields: {
             type: 'array',
-            description: 'Fields to place. Coordinates are fractions of the page (0..1), page numbers are ' \
-                         'zero-based, and the origin is the top-left corner — the same geometry DocuSeal ' \
-                         'stores, so a verified field preset can be passed through unchanged.',
+            description: 'Fields to place, unless preset is given. Coordinates are fractions of the page (0..1), ' \
+                         'page numbers are zero-based (-1 is the last page), and the origin is the top-left ' \
+                         'corner — the same geometry DocuSeal stores, so a verified field preset can be passed ' \
+                         'through unchanged.',
             items: {
               type: 'object',
               properties: {
@@ -84,7 +164,7 @@ module Mcp
                   items: {
                     type: 'object',
                     properties: {
-                      page: { type: 'integer', description: 'Zero-based page number' },
+                      page: { type: 'integer', description: 'Zero-based page number; -1 is the last page' },
                       x: { type: 'number' },
                       y: { type: 'number' },
                       w: { type: 'number' },
@@ -98,7 +178,7 @@ module Mcp
             }
           }
         },
-        required: %w[name source_path filing_folder roles fields]
+        required: %w[name source_path filing_folder roles]
       },
       annotations: {
         readOnlyHint: false,
@@ -207,7 +287,8 @@ module Mcp
       end
 
       submitters = roles.map { |role| { 'name' => role, 'uuid' => SecureRandom.uuid } }
-      raw_fields = Array.wrap(mcp_params['fields'])
+      raw_fields = fields_or_preset!(roles)
+      @reusable = reusable!(folder_name)
 
       # Every argument is checked before the download and before anything is
       # saved, so a refusal costs nothing and leaves nothing behind. Fields
@@ -246,6 +327,50 @@ module Mcp
 
     private
 
+    # The fields of the call, or those of the named preset. Never both: a
+    # call that names a preset and also sends fields has two answers to
+    # where the signatures go.
+    # rubocop:disable Metrics
+    def fields_or_preset!(roles)
+      name = mcp_params['preset'].to_s.strip
+      raw_fields = Array.wrap(mcp_params['fields'])
+
+      return raw_fields if name.empty?
+
+      raise InvalidArguments, 'give fields or preset, not both' if raw_fields.any?
+
+      preset = PRESETS[name]
+
+      raise InvalidArguments, "unknown preset #{name.inspect}; known: #{PRESET_NAMES.join(', ')}" if preset.nil?
+
+      if roles.length != preset[:roles]
+        raise InvalidArguments, "preset #{name} is for #{preset[:roles]} role(s) in signing order; roles has " \
+                                "#{roles.length}"
+      end
+
+      @preset = name
+
+      preset[:fields].map { |f| f.deep_dup }
+    end
+    # rubocop:enable Metrics
+
+    def reusable!(folder_name)
+      value = mcp_params['reusable']
+
+      raise InvalidArguments, 'reusable must be the boolean true or false' unless [nil, true, false].include?(value)
+
+      return false unless value == true
+
+      if folder_name.blank? || folder_name.match?(EMPLOYEE_FOLDER_RE) || folder_name.casecmp('default').zero?
+        raise InvalidArguments,
+              'a reusable template needs a folder_name of its own, e.g. "Time declarations", and never an ' \
+              'employee folder ("000NNN Name"): the Make scenario would take its documents for contracts and ' \
+              'look for a Notion contract page.'
+      end
+
+      true
+    end
+
     # Saves the template, attaches the PDF and sets fields and preferences.
     # Whatever fails on the way, the half-made template is removed again.
     # rubocop:disable Metrics
@@ -275,6 +400,7 @@ module Mcp
         # file name belong to the original's employee.
         'icodos_template_id' => @template.id
       )
+      preferences[IcodosWorkflow::REUSABLE_KEY] = true if @reusable
 
       # FilenameUtils.basename(blob[:filename]) is how upstream names
       # documents since 3.3.6, at every site that used to call filename.base.
@@ -317,8 +443,10 @@ module Mcp
         roles: Array.wrap(template.submitters).map { |s| s['name'] },
         fields: Array.wrap(template.fields).length,
         filing_folder: template.preferences.to_h['icodos_filing_folder'],
+        reusable: IcodosWorkflow.reusable?(template) || nil,
+        preset: @preset,
         edit_url: edit_template_url(template)
-      }
+      }.compact
 
       if reused
         Rails.logger.info("[icodos-contracts] create_contract_template reused template=#{template.id} " \
@@ -414,6 +542,10 @@ module Mcp
       rescue HexaPDF::Error => e
         raise InvalidArguments.new("#{source_path} could not be read as a PDF (#{e.message}).", code: 'invalid_pdf')
       end
+
+      # -1 is the last page, whatever the document's length (a full contract
+      # has 13 or 14 pages, and its signature blocks are on the last).
+      fields.each { |f| f['areas'].each { |a| a['page'] = pages - 1 if a['page'] == -1 } }
 
       beyond = fields.flat_map { |f| f['areas'].map { |a| [f['name'], a['page']] } }.select { |_, page| page >= pages }
 
@@ -547,7 +679,7 @@ module Mcp
       raw_areas.map do |area|
         page = area['page'].to_i
 
-        raise InvalidArguments, "#{label}: page must be zero or greater" if page.negative?
+        raise InvalidArguments, "#{label}: page must be zero or greater, or -1 for the last page" if page < -1
 
         box = %w[x y w h].to_h do |key|
           value = area[key].to_f

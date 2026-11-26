@@ -27,7 +27,7 @@ Branding overlay for our self-hosted [DocuSeal](https://github.com/docusealco/do
 | `mcp/oauth_controller.rb` | Phase D — `/oauth/authorize` and the consent screen |
 | `mcp/oauth_consent.html.erb` | Phase D — the consent page (self-contained, no app layout) |
 | `mcp/zz_mcp_oauth.rb` | Phase D — initializer: routes, log filtering, boot diagnostics, the `/mcp` hook |
-| `contracts/*` | Phase E — SharePoint contract filing: the two ICODOS MCP tools, the `/icodos/hooks/filing` hook, the Graph client and its checks |
+| `contracts/*` | Phase E and Phase 5 — SharePoint contract filing and the work after a send: the seven ICODOS MCP tools, the `/icodos/hooks/filing` hook, the Graph client and its checks, the template lifecycle, document retention and the weekly digest (`icodos_workflow.rb`) |
 | `contracts/zz_icodos_timestamp.rb` | Timestamp guard: with a timestamp server set, every configured server is tried, a token is verified before it is embedded, and a document is never signed with a broken timestamp (see below) |
 | `reveal/*` | SSO API key reveal: re-authenticate with Microsoft instead of typing a password nobody has |
 | `reminders/*` | Signature reminders, which DocuSeal ships only in Pro: scheduler, sweep, mailer, settings page |
@@ -300,7 +300,7 @@ Like the SSO layer, this is our own code distributed under the same public repos
 
 ## Phase E — contract tools: SharePoint in, signed PDF out
 
-Two MCP tools and one internal webhook that move ICODOS employment-contract preparation off the browser entirely. An agent produces the document, files it in SharePoint as before, then makes two tool calls. DocuSeal reads the file server-side, places the signature fields, sends employer-first, and files the signed PDF back when both parties have signed.
+MCP tools and one internal webhook that move ICODOS employment-contract preparation off the browser entirely. An agent produces the document, files it in SharePoint as before, then makes two tool calls; five more follow and correct it after the send (Phase 5, below). DocuSeal reads the file server-side, places the signature fields, sends employer-first, and files the signed PDF back when both parties have signed.
 
 Same overlay pattern as Phase D: bind-mounted files, no image rebuild, no new gems, no database migrations.
 
@@ -309,7 +309,12 @@ Same overlay pattern as Phase D: bind-mounted files, no image rebuild, no new ge
 | Tool | What it does |
 |---|---|
 | `icodos_create_contract_template` | Reads a PDF from the SharePoint contracts folder, creates a template with fields placed, roles assigned, folder set, and the filing destination recorded |
-| `icodos_send_contract` | Sends for signature with `submitters_order: 'preserved'`. Without `confirm` it returns a **preview** (signers in order, each signer's email text, filing folder, expiry, email code) and a `preview_token`, and sends nothing. It sends only with `confirm: true` plus the token of a preview of exactly the same arguments |
+| `icodos_send_contract` | Sends for signature with `submitters_order: 'preserved'`. Without `confirm` it returns a **preview** (signers in order, each signer's email text, prefilled values, filing folder and file name, expiry, email code) and a `preview_token`, and sends nothing. It sends only with `confirm: true` plus the token of a preview of exactly the same arguments |
+| `icodos_pending_signatures` | Read only: every document out for signature, whose turn it is, since when, reminders sent and the next one; documents completed lately and whether the server filed them |
+| `icodos_get_submission` | Read only: one submission in full, with signers in order, events, reminders, filing path and what the action tools did to it |
+| `icodos_set_reminders` | Pause, resume, or send one reminder now, through the reminder engine. Preview and `preview_token` first, like the send |
+| `icodos_void_submission` | Voids (archives) a document still out for signature: links stop working, reminders stop, nothing is filed. Preview first. Never a signed one |
+| `icodos_correct_signer` | Corrects a signer's address or name before they sign; an invited signer's old link is revoked and the invitation sent again. Preview first |
 
 Both inherit `Mcp::McpBaseController`, so authentication, the archived-user check and the Phase D OAuth hook apply exactly as they do to the upstream tools. Archiving a DocuSeal user still revokes access.
 
@@ -318,7 +323,7 @@ Both inherit `Mcp::McpBaseController`, so authentication, the archived-user chec
 | Tool | Offered |
 |---|---|
 | `search_templates`, `load_template`, `search_documents` | yes, read only, upstream |
-| `icodos_create_contract_template`, `icodos_send_contract` | yes |
+| the seven `icodos_*` tools above | yes |
 | `send_documents`, `create_template` | **no**, refused since 25 November 2026 |
 | any tool a later upstream version adds | **no**, until it is reviewed and named in `ICODOS_MCP_UPSTREAM_TOOLS` |
 
@@ -328,7 +333,7 @@ The policy is an allowlist. `send_documents` and `create_template` sat next to t
 
 ### Errors the tools return
 
-Every failure of the two ICODOS tools is a tool error (`isError: true`) whose text is one JSON object:
+Every failure of an ICODOS tool is a tool error (`isError: true`) whose text is one JSON object:
 
 ```json
 {"error": "preview_expired", "message": "...", "retryable": false,
@@ -353,12 +358,14 @@ Every failure of the two ICODOS tools is a tool error (`isError: true`) whose te
 | `sharepoint_unavailable`, `sharepoint_unreachable` | SharePoint is busy or the network failed | yes |
 | `sharepoint_config` | the server's SharePoint access is broken; an administrator must act | no |
 | `submission_failed`, `save_failed` | DocuSeal did not build or save the record | no |
+| `not_pending` | the submission is completed, declined, expired or voided; only a pending one can be changed | no |
+| `too_soon` | a reminder to this signer is less than 20 hours old; a reminder now would be held | no |
 | `internal_error` | anything nobody anticipated; logged with its class and place | no |
 | `tool_refused` | the tool is not offered on this instance | no |
 
 ### Repeated calls
 
-Both tools can be called again safely after a timeout. The send tool answers a confirmed call whose `preview_token` was already used with the send it made then (`"replayed": true`), not with a second one; a send that fails before the invitations go out removes its submission and releases the token, so the identical call can be repeated. The create tool checks every field, including its page against the PDF's page count, before anything is saved, so a refusal leaves nothing behind; an identical call by the same user within 24 hours returns the template the first one made (`"reused": true`), and while one call is creating, an identical one is told `in_progress`.
+Both tools can be called again safely after a timeout, and so can the three action tools of Phase 5 (below). The send tool answers a confirmed call whose `preview_token` was already used with the send it made then (`"replayed": true`), not with a second one; a send that fails before the invitations go out removes its submission and releases the token, so the identical call can be repeated. The create tool checks every field, including its page against the PDF's page count, before anything is saved, so a refusal leaves nothing behind; an identical call by the same user within 24 hours returns the template the first one made (`"reused": true`), and while one call is creating, an identical one is told `in_progress`.
 
 ### The audit record
 
@@ -377,6 +384,32 @@ Every `tools/call` to `/mcp`, whichever tool it names and however it ends, leave
 
 ```bash
 docker compose exec -T app tail -n 20 /data/docuseal/icodos_audit/mcp-$(date -u +%Y-%m).jsonl
+```
+
+### After the send: tracking and correcting (Phase 5)
+
+Since November 2026 a document can be sent, followed, corrected and filed without opening the web interface, and the template list no longer grows by one with every document.
+
+**Standard templates with values.** A layout that does not change between documents (a monthly time sheet) is made once with `reusable: true` and sent again and again. The send fills the varying parts in: `values` per signer, field name to value, for text, number, date and checkbox fields only, never a signature; they are read-only for the signer, shown in the preview and bound by its token. Each send names its signed copy (`filing_name`), because every send of a reusable template has the same draft. `filing_name` is refused for a one-off template: its signed copy is named after its draft, and the Make scenario that completes the Notion contract page finds the page by exactly that name. For the same reason a reusable template may not live in an employee folder (`000NNN Name`), which routes documents to that write-back.
+
+**Named field presets.** The create tool takes `preset` instead of `fields`: `amendment_v1`, `full_contract_v1`, `eu_time_declaration_v5`, `eu_time_declaration_v5_single`, `oxbren_time_declaration_v1`, `oxbren_time_declaration_v1_single`. Measured from verified templates, kept in `PRESETS` in the create tool. A page of `-1` means the last page, whatever the document's length. A layout that moved still needs `fields`; the `edit_url` is where that is seen.
+
+**Reading.** `icodos_pending_signatures` and `icodos_get_submission` describe a submission the same way: status, signers in signing order, whose turn it is (by the reminder sweep's own rule, so "waiting on" and "who would be reminded" never disagree), what the reminder engine will do next, and where the signed copy is or will be filed. Upstream's `search_documents` returns every submission matching a name, abandoned copies included, with no reminder or filing state.
+
+**Acting.** The three tools that change a sent document use the send tool's confirmation: a preview with a `preview_token` (HMAC over the user and a digest of everything shown, including the state it acts on, 15 minutes, once, with a key of each tool's own), and `confirm: true` with that token. A confirmation repeated after a timeout answers with what was done (`"replayed": true`) from Redis or, if Redis lost it, from the record on the submission (`icodos_actions`). That check comes before any check of the submission's state, because the action changed it: a repeated void would otherwise read "not pending", a repeated correction "nothing to correct". The audit line of every call carries `submission_id` and `applied` (false for a preview).
+
+- `icodos_set_reminders` writes `paused_until` into the submission's own reminder policy, which the engine already honoured, or removes it; `send_now` sends through the engine's sender, so the 20-hour cap, the count and the timeline event apply, and the preview refuses with `too_soon` when the cap would hold it.
+- `icodos_void_submission` is upstream's archive of a submission, with its `submission.archived` webhook event, and a reason recorded. Nobody is emailed.
+- `icodos_correct_signer`: the signing link is the secret in the invitation already sent, so correcting the address of an invited signer gives them a new link (the old one stops working) and sends the invitation again; a signer not invited yet only gets the new address. The first signer stays at a first-signer domain, and the email code is switched on for an outside address and never off.
+
+**Template lifecycle.** A template made by the create tool that is not reusable is archived a day after the last of its submissions was signed and filed by the server, or voided; hourly, with the filing reconciliation. Archived, not deleted: it keeps its submissions and documents and can be restored in the web interface. The day's wait leaves the Make scenario, which runs from the same completion webhook, its window. Templates with no submission yet, a pending one, or one the server did not file stay.
+
+**Document retention.** SharePoint is the record: the filed PDF carries the audit trail. Documents of a submission the server filed are removed from this server 90 days after completion (`ICODOS_DOCUMENT_RETENTION_DAYS`, at least 30, or `off`): the draft once its template is archived and every submission of it is done, the signed PDF, each signer's copy, the signature images and the audit trail. Only while the filed copy is still at its recorded SharePoint path; a file moved or deleted there keeps its documents here, and the log says so. The database records and the event history stay, and `icodos_get_submission` shows `documents_removed_at`. At most 25 submissions an hour.
+
+**Weekly digest.** Mondays, from a timer on the host: sent, signed, filed, waiting (longest first, with the next reminder) and what needs a person (completed and not filed, declined, expired, waiting more than two weeks, reminders ended). Plain text, through the instance's own mail settings, to `ICODOS_DIGEST_TO`; without recipients it is printed, not mailed:
+
+```bash
+docker compose exec -T -w /app app rails runner 'IcodosWorkflow::Digest.call'
 ```
 
 ### Why not the upstream tools
@@ -481,6 +514,9 @@ Deliveries are recorded as `WebhookEvent`s and visible in the DocuSeal UI, so fa
 | `ICODOS_AUDIT_DIR` | Optional; where the audit record of tool calls is written, default `/data/docuseal/icodos_audit` |
 | `ICODOS_FILING_HOOK_URL` | Optional; the filing hook's registered address, default `http://app:3000/icodos/hooks/filing` |
 | `ICODOS_MCP_UPSTREAM_TOOLS` | Optional; the upstream tools agents may use. Unset: `search_templates`, `load_template`, `search_documents`. `none` or `all` |
+| `ICODOS_TEMPLATE_LIFECYCLE` | Optional; `on` (default) archives one-off contract templates a day after filing, `off` keeps them |
+| `ICODOS_DOCUMENT_RETENTION_DAYS` | Optional; days after completion until documents the server filed are removed from it (default 90, at least 30), or `off` |
+| `ICODOS_DIGEST_TO` | Optional; the weekly digest's recipients, comma-separated. Empty: printed, not mailed |
 
 ### The credential
 
@@ -514,7 +550,7 @@ It verifies the configuration, both tokens, the SharePoint roles claim, site and
 
 Phase E depends on these internal APIs, none of which are a public contract:
 
-`Mcp::McpBaseController` as superclass, with `mcp_params`, `render_tool_result`, `render_result`, `render_error`, `current_ability`, `check_authorization` and (prepended) `current_user` · `McpController#call`, `McpController::TOOLS`, `McpController::TOOL_CONTROLLERS`, `request.request_parameters` · `Mcp::ProtocolController#tools_list` and `mcp_body` · `McpToken` · `Templates::CreateAttachments` · `TemplateFolders.find_or_create_by_name` · `SearchEntries.enqueue_reindex` · `WebhookUrls.enqueue_events` · `Submissions.create_from_submitters` (its attribute keys, `is_viewer`, `require_email_2fa`, `expire_at`) · `Submissions.send_signature_requests` · `Templates.build_default_expire_at` · how `SubmitterMailer#invitation_email` chooses its text, with `AccountConfig::SUBMITTER_INVITATION_EMAIL_KEY` · `Submissions::EnsureCombinedGenerated` · `WebhookUrls::Signatures` · `WebhookUrl#url` and `#hmac_secret` · the webhook payload's `data.id` · `Template#preferences` and `Submission#preferences` as free-form stores · `Templates::Clone` copying preferences. The timestamp guard depends on `Submissions::TimestampHandler#sign` and HexaPDF's `SignedDataCreator#create_unsigned_attrs`.
+`Mcp::McpBaseController` as superclass, with `mcp_params`, `render_tool_result`, `render_result`, `render_error`, `current_ability`, `check_authorization` and (prepended) `current_user` · `McpController#call`, `McpController::TOOLS`, `McpController::TOOL_CONTROLLERS`, `request.request_parameters` · `Mcp::ProtocolController#tools_list` and `mcp_body` · `McpToken` · `Templates::CreateAttachments` · `TemplateFolders.find_or_create_by_name` · `SearchEntries.enqueue_reindex` · `WebhookUrls.enqueue_events` · `Submissions.create_from_submitters` (its attribute keys, `is_viewer`, `require_email_2fa`, `expire_at`) · `Submissions.send_signature_requests` · `Templates.build_default_expire_at` · how `SubmitterMailer#invitation_email` chooses its text, with `AccountConfig::SUBMITTER_INVITATION_EMAIL_KEY` · `Submissions::EnsureCombinedGenerated` · `WebhookUrls::Signatures` · `WebhookUrl#url` and `#hmac_secret` · the webhook payload's `data.id` · `Template#preferences` and `Submission#preferences` as free-form stores · `Templates::Clone` copying preferences · for Phase 5: the `values` (by field uuid) and `readonly_fields` attributes of `Submissions::CreateFromSubmitters`, `Submitters::NormalizeValues.normalize_value`, `Submitters.send_signature_requests`, `Submitter#slug` as the signing link's secret, the signing page refusing an archived submission, the attachment names `audit_trail`, `combined_document`, `merged_document`, `preview_merged_document`, `preview_documents`, `documents` (submission), `documents`, `attachments`, `preview_documents` (submitter) and `documents` (template), and `ApplicationMailer` with its interceptor. The timestamp guard depends on `Submissions::TimestampHandler#sign` and HexaPDF's `SignedDataCreator#create_unsigned_attrs`.
 
 The prepends fail closed and log `[icodos-contracts] could not attach to the MCP controllers`; the boot line reports whether the dispatch hook attached. From an MCP client, unregistered tools are indistinguishable from tools that never existed, which is why the smoke check asserts registration explicitly.
 

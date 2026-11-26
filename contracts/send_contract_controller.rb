@@ -65,6 +65,13 @@ module Mcp
                   type: 'string',
                   description: 'For employees this is their PRIVATE address, so the record outlives their ' \
                                'ICODOS account'
+                },
+                values: {
+                  type: 'object',
+                  description: 'Optional: field name -> value, filled into this role\'s text, number, date and ' \
+                               'checkbox fields before sending, read-only for the signer. Never a signature. ' \
+                               'For standard templates (a monthly time sheet); the preview shows every value.',
+                  additionalProperties: { type: %w[string number boolean] }
                 }
               },
               required: %w[role name email]
@@ -95,6 +102,12 @@ module Mcp
             type: 'string',
             description: 'Optional override for where the signed PDF is filed. Defaults to the folder recorded ' \
                          'on the template at creation time, which is almost always what you want.'
+          },
+          filing_name: {
+            type: 'string',
+            description: 'Required for a reusable (standard) template, refused for any other: the file name of ' \
+                         'the signed copy without " (signed).pdf", e.g. "20261201-EU_Time_Declaration-Doe_Jane_' \
+                         '2026-11-v1". A one-off contract template is always filed under its draft\'s name.'
           },
           require_email_code: {
             type: 'boolean',
@@ -129,6 +142,13 @@ module Mcp
     PREVIEW_NONCE_KEY = 'icodos_preview_nonce'
     DATE_ONLY_RE = /\A\d{4}-\d{2}-\d{2}\z/.freeze
     MIN_EXPIRY = 3600
+
+    # Field types that may be filled in by the sender (values). Never a
+    # signature, initials, an image or a file: what a signer signs with is
+    # theirs alone.
+    PREFILL_TYPES = %w[text number date checkbox].freeze
+    MAX_VALUE_LENGTH = 2000
+    MAX_FILING_NAME = 180
 
     # The first signer is structurally the employer — the template's role order
     # decides who signs first, and for ICODOS employment documents that is
@@ -275,6 +295,8 @@ module Mcp
       authorize!(:create, Submission.new(template: @template, account_id: current_user.account_id))
 
       ordered = match_submitters!(Array.wrap(mcp_params['submitters']))
+      @values = resolve_values!(ordered)
+      @filing_name = resolve_filing_name!
       filing_folder = resolve_filing_folder!
       expire_at = parse_expire_at!(mcp_params['expire_at'])
       email_code = resolve_email_codes!(ordered)
@@ -345,8 +367,10 @@ module Mcp
         # template nor any parsing of its name to know where the signed PDF
         # goes. The preview nonce makes the single use survive a Redis restart.
         submissions.each do |submission|
-          submission.update!(preferences: (submission.preferences || {}).merge(FILING_FOLDER_KEY => filing_folder,
-                                                                               PREVIEW_NONCE_KEY => nonce))
+          submission.update!(preferences: (submission.preferences || {}).merge(
+            { FILING_FOLDER_KEY => filing_folder, PREVIEW_NONCE_KEY => nonce,
+              IcodosWorkflow::FILING_NAME_KEY => @filing_name }.compact
+          ))
         end
 
         WebhookUrls.enqueue_events(submissions, 'submission.created')
@@ -382,8 +406,9 @@ module Mcp
           { name: s.name, email: s.email, status: s.status, email_code: s.preferences['require_email_2fa'] == true }
         end,
         filing_folder: submission.preferences.to_h[FILING_FOLDER_KEY] || filing_folder,
+        filing_name: submission.preferences.to_h[IcodosWorkflow::FILING_NAME_KEY],
         expire_at: submission.expire_at&.iso8601
-      }
+      }.compact
 
       if replayed
         Rails.logger.info("[icodos-contracts] replayed submission=#{submission.id} template=#{@template.id} " \
@@ -442,11 +467,13 @@ module Mcp
         template: { id: @template.id, name: @template.name },
         documents: Array.wrap(@template.schema).map { |item| item['name'] },
         signing_order: ordered.each_with_index.map do |s, i|
-          { order: i + 1, role: s['role'], name: s['name'], email: s['email'], email_code: email_code[i] }
+          { order: i + 1, role: s['role'], name: s['name'], email: s['email'], email_code: email_code[i],
+            values: @values[i][:names].presence }.compact
         end,
         first_invitation_to: ordered.first['email'],
         remaining_notified_after: ordered.first['role'],
         filing_folder: filing_folder,
+        filed_as: "#{@filing_name || Icodos::FilingHookController::Filing.signed_filename_base(@template)} (signed).pdf",
         expire_at: expire_at&.iso8601,
         template_default_expiry: expire_at ? nil : template_expiry_default['default_expire_at_duration'],
         emails: messages.map do |m|
@@ -473,7 +500,11 @@ module Mcp
         'filing_folder' => filing_folder,
         'expire_at' => expire_at&.utc&.iso8601,
         'email_code' => email_code,
-        'emails' => messages.map { |m| [m['role'], m['subject'], m['body']] }
+        'emails' => messages.map { |m| [m['role'], m['subject'], m['body']] },
+        # Prefilled values are part of the document the signers sign, and
+        # the file name of the signed copy part of where it is kept.
+        'values' => @values.map { |v| v[:names] },
+        'filing_name' => @filing_name
       }
     end
 
@@ -707,6 +738,7 @@ module Mcp
         role = entry['role'].to_s.strip
         name = entry['name'].to_s.strip
         email = entry['email'].to_s.strip
+        (@raw_values ||= {})[role] = entry['values'] unless entry['values'].nil?
 
         raise InvalidArguments, 'each submitter needs a role' if role.blank?
         raise InvalidArguments, "#{role}: name is required" if name.blank?
@@ -749,6 +781,14 @@ module Mcp
       ordered.each_with_index.map do |s, i|
         attrs = s.dup
         attrs['require_email_2fa'] = email_code[i]
+
+        # Keyed by field uuid, as Submissions::CreateFromSubmitters reads
+        # them; read-only, so the signer confirms the values and cannot
+        # change them.
+        if @values[i][:uuids].any?
+          attrs['values'] = @values[i][:uuids]
+          attrs['readonly_fields'] = @values[i][:names].keys
+        end
 
         if i.zero? || given_message
           attrs['message'] = { 'subject' => messages[i]['subject'], 'body' => messages[i]['body'] }.compact
@@ -871,6 +911,11 @@ module Mcp
     end
 
     def first_signer_domains
+      self.class.first_signer_domains
+    end
+
+    # Also read by icodos_correct_signer, which applies the same rule.
+    def self.first_signer_domains
       raw = ENV['ICODOS_CONTRACTS_FIRST_SIGNER_DOMAINS'].to_s.strip
 
       return DEFAULT_FIRST_SIGNER_DOMAINS if raw.empty?
@@ -881,6 +926,110 @@ module Mcp
       # off; it falls back to the default like an unset variable.
       list.empty? ? DEFAULT_FIRST_SIGNER_DOMAINS : list
     end
+
+    # Values filled in before sending, per signer in signing order:
+    # { uuids: { field uuid => value }, names: { field name => value } }.
+    # Only the role's own fields, only the four plain types, every name
+    # known, every value normalised as upstream's API would.
+    # rubocop:disable Metrics
+    def resolve_values!(ordered)
+      raw_by_role = @raw_values || {}
+
+      ordered.map do |s|
+        raw = raw_by_role[s['role']]
+
+        next({ uuids: {}, names: {} }) if raw.nil? || (raw.respond_to?(:empty?) && raw.empty?)
+
+        raise InvalidArguments, "#{s['role']}: values must be an object of field name to value" unless raw.is_a?(Hash)
+
+        uuid = @template.submitters.find { |r| r['name'] == s['role'] }.to_h['uuid']
+        fields = Array.wrap(@template.fields).select { |f| f['submitter_uuid'] == uuid }
+        uuids = {}
+        names = {}
+
+        raw.each do |key, value|
+          field = fields.find { |f| f['name'].to_s == key.to_s } ||
+                  fields.find { |f| f['name'].to_s.casecmp(key.to_s).zero? }
+
+          if field.nil?
+            raise InvalidArguments, "#{s['role']}: no field #{key.to_s.inspect} for this role; its fields are " \
+                                    "#{fields.map { |f| f['name'] }.inspect}"
+          end
+
+          unless PREFILL_TYPES.include?(field['type'])
+            raise InvalidArguments, "#{s['role']}: #{field['name']} is a #{field['type']} field; only " \
+                                    "#{PREFILL_TYPES.join(', ')} fields can be filled in"
+          end
+
+          unless [String, Integer, Float, TrueClass, FalseClass].any? { |k| value.is_a?(k) }
+            raise InvalidArguments, "#{s['role']}: the value for #{field['name']} must be text, a number or true/false"
+          end
+
+          if value.is_a?(String) && (value.length > MAX_VALUE_LENGTH || value.match?(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/))
+            raise InvalidArguments, "#{s['role']}: the value for #{field['name']} is longer than " \
+                                    "#{MAX_VALUE_LENGTH} characters or holds control characters"
+          end
+
+          raise InvalidArguments, "#{s['role']}: #{field['name']} is given twice" if uuids.key?(field['uuid'])
+
+          normalized =
+            begin
+              Submitters::NormalizeValues.normalize_value(field, value)
+            rescue StandardError
+              nil
+            end
+
+          if normalized.nil? || normalized == ''
+            raise InvalidArguments, "#{s['role']}: #{value.inspect} is not a value for the #{field['type']} field " \
+                                    "#{field['name']}#{field.dig('preferences', 'format') ? " (format #{field.dig('preferences', 'format')})" : ''}"
+          end
+
+          uuids[field['uuid']] = normalized
+          names[field['name']] = normalized
+        end
+
+        { uuids: uuids, names: names }
+      end
+    end
+    # rubocop:enable Metrics
+
+    # The name of the signed copy, for a reusable template: every send of it
+    # has the same draft, so the draft's name would file each month's sheet
+    # over the last one's name (with a numeric suffix). Refused for a one-off
+    # template: its signed copy is named after its draft, and the Make
+    # scenario finds the Notion contract page by exactly that name.
+    # rubocop:disable Metrics
+    def resolve_filing_name!
+      raw = mcp_params['filing_name']
+      reusable = IcodosWorkflow.reusable?(@template)
+
+      if raw.blank?
+        return nil unless reusable
+
+        raise InvalidArguments,
+              'filing_name is required for a reusable template: every send of it would otherwise be filed under ' \
+              'the same name. Give the file name of the signed copy, e.g. "20261201-EU_Time_Declaration-Doe_Jane_' \
+              '2026-11-v1".'
+      end
+
+      unless reusable
+        raise InvalidArguments,
+              'filing_name is only for reusable templates. This template\'s signed copy is filed under its draft\'s ' \
+              'name, which the Notion write-back relies on. Leave filing_name out.'
+      end
+
+      name = raw.to_s.strip.sub(/\.pdf\z/i, '').sub(/\s*\(signed\)\z/i, '').strip
+
+      if name.empty? || name.length > MAX_FILING_NAME ||
+         Icodos::FilingHookController::Filing.sanitize_filename(name) != name
+        raise InvalidArguments,
+              "filing_name #{raw.to_s.inspect} is not a usable file name: at most #{MAX_FILING_NAME} characters, " \
+              'no / \\ : * ? " < > | or control characters, no leading dot, single spaces.'
+      end
+
+      name
+    end
+    # rubocop:enable Metrics
 
     # A contract that cannot be filed once signed is worse than one that is not
     # sent, so this fails now rather than at completion.

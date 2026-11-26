@@ -60,6 +60,15 @@ services:
       - ./contracts/send_contract_controller.rb:/app/app/controllers/mcp/icodos_send_contract_controller.rb:ro
       - ./contracts/filing_hook_controller.rb:/app/app/controllers/icodos/filing_hook_controller.rb:ro
       - ./contracts/zz_icodos_contracts.rb:/app/config/initializers/zz_icodos_contracts.rb:ro
+      # Phase 5: tracking and correcting after a send. The library is shared
+      # by the five tools and the template lifecycle; its filename matches
+      # its constant (Zeitwerk).
+      - ./contracts/icodos_workflow.rb:/app/lib/icodos_workflow.rb:ro
+      - ./contracts/pending_signatures_controller.rb:/app/app/controllers/mcp/icodos_pending_signatures_controller.rb:ro
+      - ./contracts/get_submission_controller.rb:/app/app/controllers/mcp/icodos_get_submission_controller.rb:ro
+      - ./contracts/set_reminders_controller.rb:/app/app/controllers/mcp/icodos_set_reminders_controller.rb:ro
+      - ./contracts/void_submission_controller.rb:/app/app/controllers/mcp/icodos_void_submission_controller.rb:ro
+      - ./contracts/correct_signer_controller.rb:/app/app/controllers/mcp/icodos_correct_signer_controller.rb:ro
       # BOTH halves of the certificate are needed. The private key signs the
       # client assertion; the certificate supplies the SHA-1 thumbprint Entra
       # uses to identify which uploaded credential signed it (the x5t header).
@@ -173,6 +182,14 @@ services:
       # create_template and any tool a later upstream version adds stay
       # refused. `none` offers no upstream tool, `all` every one as shipped.
       - ICODOS_MCP_UPSTREAM_TOOLS=${ICODOS_MCP_UPSTREAM_TOOLS:-}
+      # Phase 5. Contract templates archived a day after their documents are
+      # signed and filed (`off` stops it); documents the server filed removed
+      # from it after this many days, SharePoint being the record (`off`
+      # keeps them); the weekly digest's recipients, comma-separated (empty:
+      # printed by the host's timer, not mailed).
+      - ICODOS_TEMPLATE_LIFECYCLE=${ICODOS_TEMPLATE_LIFECYCLE:-on}
+      - ICODOS_DOCUMENT_RETENTION_DAYS=${ICODOS_DOCUMENT_RETENTION_DAYS:-90}
+      - ICODOS_DIGEST_TO=${ICODOS_DIGEST_TO:-}
       # SSO API key reveal. Off unless explicitly true; when off the upstream
       # password dialog is served unchanged.
       - ICODOS_SSO_REVEAL_ENABLED=${ICODOS_SSO_REVEAL_ENABLED:-false}

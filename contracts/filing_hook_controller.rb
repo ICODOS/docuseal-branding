@@ -53,6 +53,9 @@ module Icodos
     # Set by icodos_create_contract_template to the template's own id, so a
     # copy, which inherits it, can be told from the original.
     TEMPLATE_ID_KEY = 'icodos_template_id'
+    # Set by icodos_send_contract on a send of a reusable template: the name
+    # of the signed copy (IcodosWorkflow::FILING_NAME_KEY).
+    FILING_NAME_KEY = 'icodos_filing_name'
     MARKER = 'icodos-phase-e'
 
     SIGNED_SUFFIX = ' (signed)'
@@ -371,7 +374,31 @@ module Icodos
         Rails.logger.info(line)
         puts line
 
+        archive_settled_templates
+
         failed.empty?
+      end
+
+      # Templates whose documents are signed and filed (or voided) for a day
+      # are archived, so the template list stops growing with every document
+      # (IcodosWorkflow::Lifecycle), and documents the server filed are
+      # removed from it after the retention period (IcodosWorkflow::Retention,
+      # decision D7). Hourly, with the reconciliation. A failure is logged and
+      # never fails the filing run, whose exit status the health job reads.
+      # ICODOS_TEMPLATE_LIFECYCLE=off and ICODOS_DOCUMENT_RETENTION_DAYS=off
+      # stop them.
+      def archive_settled_templates
+        unless ENV['ICODOS_TEMPLATE_LIFECYCLE'].to_s.strip.casecmp('off').zero?
+          begin
+            IcodosWorkflow::Lifecycle.archive_filed_templates
+          rescue StandardError, NameError => e
+            Rails.logger.error("[icodos-contracts] lifecycle failed: #{e.class}: #{e.message}")
+          end
+        end
+
+        IcodosWorkflow::Retention.purge_filed_documents
+      rescue StandardError, NameError => e
+        Rails.logger.error("[icodos-contracts] retention failed: #{e.class}: #{e.message}")
       end
 
       # The combined PDF is generated on demand and behind a lock, because the
@@ -392,20 +419,32 @@ module Icodos
       #   20260814-Jane Doe-Working contract amendment-v1 (signed).pdf
       # Derived from the source document the contract was built from, which the
       # create tool records on the template, so the signed copy sits next to its
-      # draft under the same name.
+      # draft under the same name. The Make scenario finds the Notion contract
+      # page by this same name, so it is never changed for a one-off template.
+      #
+      # A reusable template (a standard time sheet sent every month) has one
+      # draft for every send; its sends carry their own name (filing_name of
+      # icodos_send_contract), recorded on the submission, which wins.
       def signed_filename(submission)
-        source = submission.template&.preferences.to_h[SOURCE_KEY]
+        given = submission.preferences.to_h[FILING_NAME_KEY]
 
         base =
-          if source.present?
-            File.basename(source, File.extname(source))
+          if given.present?
+            given
           else
-            submission.template_schema&.first&.dig('name').presence ||
-              submission.template&.name.presence ||
+            signed_filename_base(submission.template, fallback: submission.template_schema&.first&.dig('name')) ||
               "submission-#{submission.id}"
           end
 
         "#{sanitize_filename(base)}#{SIGNED_SUFFIX}.pdf"
+      end
+
+      def signed_filename_base(template, fallback: nil)
+        source = template&.preferences.to_h[SOURCE_KEY]
+
+        return File.basename(source, File.extname(source)) if source.present?
+
+        fallback.presence || template&.name.presence
       end
 
       # The fallbacks above draw on the TEMPLATE NAME, which is free text supplied
